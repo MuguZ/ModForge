@@ -23,7 +23,9 @@ Alternatively launch with `python -m modforge`. This app does not need root acce
 2. Import a ZIP in **Mod Library**. ModForge retains the archive and extracts it after checking paths, entry types, file counts, sizes, and compression ratios. Double-click a row to inspect the paths.
 3. Select or create a profile and enable mods in **Profiles**. Profile edits do not change game files.
 4. Deploy from **Dashboard** only after checking the preview. ZIP paths are preserved exactly: the archive should contain intended paths such as `archive/pc/mod/example.archive` or `r6/scripts/example.lua`. ModForge never guesses or flattens destinations. Duplicate destination paths block deployment.
-5. Use **Deployments** to review history and roll back an eligible deployment.
+5. Review the per-file destination preview before deployment. It labels new files, files that will be backed up and replaced, and unsafe destinations that block deployment. Conflicts list the enabled mods that share a destination.
+6. Use **Deployments** and **Backups** to review file counts, rollback eligibility, and snapshot presence. Backups are hash-checked before restore.
+7. If an operation is interrupted or its journal/database/backup state is uncertain, open **Recovery**. Startup only reports unresolved work; it does not change game files. Inspect the affected paths and backup state, then explicitly confirm recovery.
 
 Framework instructions, REDmod deployment, dependency installation, and configuration edits remain manual. ModForge cannot establish compatibility for every mod.
 
@@ -49,7 +51,7 @@ Rollback compares current hashes with the expected deployed hashes. External cha
 
 Atomic rename and flush durability depend on the filesystem and storage device. A process kill, kernel crash, power loss, or disk failure can interrupt a transaction. Recovery never blindly replays a deployment; if current contents do not match either recorded state, it stops and preserves recovery material. Advisory locks coordinate ModForge instances, not unrelated programs, and cannot prevent a different application from changing the same game files. Permissions and metadata beyond ordinary file mode are not guaranteed. Symlink-based mod layouts are intentionally unsupported. A corrupt journal or an externally replaced file with no valid original backup needs manual intervention.
 
-Archive extraction, deployment, rollback, journal inspection, and recovery run in a Qt thread pool so the window remains responsive. Cancellation is unavailable once a filesystem transaction starts; failures retain their journal and recovery material. Directory opening uses Qt desktop integration.
+Archive extraction, deployment, rollback, journal inspection, and recovery run in a Qt thread pool so the window remains responsive. The sidebar shows an indeterminate progress indicator and current operation. Cancellation is unavailable once a filesystem transaction starts; failures retain their journal and recovery material. Directory opening uses Qt desktop integration.
 
 ## Test and development
 

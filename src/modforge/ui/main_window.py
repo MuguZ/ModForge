@@ -1,10 +1,12 @@
 from __future__ import annotations
 import logging
+import stat
 from pathlib import Path
 from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget, QInputDialog, QCheckBox)
+    QTableWidgetItem, QVBoxLayout, QWidget, QInputDialog, QDialog, QDialogButtonBox,
+    QProgressBar)
 from modforge.config import AppPaths
 from modforge.core.archive_importer import ArchiveError
 from modforge.core.conflict_detector import detect_conflicts
@@ -45,6 +47,8 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(button)
         side.addStretch()
         version = QLabel("SAFE FILE DEPLOYMENT\nVersion 0.1.0"); version.setObjectName("muted"); side.addWidget(version)
+        self.operation_label = QLabel("Ready"); self.operation_label.setObjectName("muted"); self.operation_label.setWordWrap(True); side.addWidget(self.operation_label)
+        self.operation_progress = QProgressBar(); self.operation_progress.setRange(0, 0); self.operation_progress.setTextVisible(False); self.operation_progress.hide(); side.addWidget(self.operation_progress)
         layout.addWidget(sidebar); layout.addWidget(self.stack, 1); self.setCentralWidget(root)
         self.show_page("Dashboard")
         self.refresh()
@@ -69,6 +73,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(QLabel("Cyberpunk 2077 is the first supported game.")); self.game_status = QLabel(); self.game_status.setObjectName("muted"); layout.addWidget(self.game_status); layout.addStretch()
         elif name == "Mod Library":
             self.mod_table = QTableWidget(0,5); self.mod_table.setHorizontalHeaderLabels(["Mod", "Version", "Imported", "Archive", "Files"]); self.mod_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.mod_table,1)
+            self.mod_empty = QLabel("Your library is empty. Import a ZIP archive to get started."); self.mod_empty.setObjectName("muted"); self.mod_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.mod_empty)
             self.mod_table.cellDoubleClicked.connect(self.show_mod_contents)
         elif name == "Profiles":
             row = QHBoxLayout(); self.profile_combo = QComboBox(); self.profile_combo.currentIndexChanged.connect(self.refresh_profile_files); row.addWidget(QLabel("Active profile")); row.addWidget(self.profile_combo,1)
@@ -76,15 +81,21 @@ class MainWindow(QMainWindow):
             rename = QPushButton("Rename"); rename.clicked.connect(self.rename_profile); row.addWidget(rename)
             delete = QPushButton("Delete"); delete.clicked.connect(self.delete_profile); row.addWidget(delete); layout.addLayout(row)
             self.profile_table = QTableWidget(0,4); self.profile_table.setHorizontalHeaderLabels(["Enabled", "Mod", "Version", "Imported"]); self.profile_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.profile_table,1)
+            self.profile_empty = QLabel("No imported mods yet. Add ZIP archives in Mod Library."); self.profile_empty.setObjectName("muted"); self.profile_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.profile_empty)
             self.profile_table.cellChanged.connect(self.profile_toggled)
         elif name == "Deployments":
-            self.deployment_table = QTableWidget(0,4); self.deployment_table.setHorizontalHeaderLabels(["ID", "Started", "Profile", "Status"]); self.deployment_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.deployment_table,1)
+            self.deployment_table = QTableWidget(0,5); self.deployment_table.setHorizontalHeaderLabels(["ID", "Started", "Profile", "Files", "Status"]); self.deployment_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.deployment_table,1)
+            self.deployment_empty = QLabel("No deployments recorded yet."); self.deployment_empty.setObjectName("muted"); self.deployment_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.deployment_empty)
             btn = QPushButton("Rollback selected deployment"); btn.clicked.connect(self.rollback_selected); layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignLeft)
         elif name == "Recovery":
             self.recovery_table = QTableWidget(0,5); self.recovery_table.setHorizontalHeaderLabels(["Deployment ID", "Started", "State", "Files", "Issue"]); self.recovery_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.recovery_table,1)
+            self.recovery_empty = QLabel("No unresolved deployment journals. Startup did not make any recovery changes."); self.recovery_empty.setObjectName("muted"); self.recovery_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.recovery_empty)
             review = QPushButton("Review selected recovery…"); review.setObjectName("primary"); review.clicked.connect(self.review_recovery); layout.addWidget(review,alignment=Qt.AlignmentFlag.AlignLeft)
         elif name == "Backups":
-            label = QLabel(f"Backups are retained per deployment under:\n{self.paths.data / 'backups'}\n\nRollback never deletes backups."); label.setObjectName("muted"); layout.addWidget(label); layout.addStretch()
+            label = QLabel(f"Deployment snapshots are retained under {self.paths.data / 'backups'}."); label.setObjectName("muted"); layout.addWidget(label)
+            self.backup_table = QTableWidget(0,4); self.backup_table.setHorizontalHeaderLabels(["Deployment ID", "Created", "Files", "Snapshot status"]); self.backup_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.backup_table,1)
+            self.backup_empty = QLabel("No deployment snapshots yet."); self.backup_empty.setObjectName("muted"); self.backup_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.backup_empty)
+            retained = QLabel("Snapshots remain available after rollback."); retained.setObjectName("muted"); layout.addWidget(retained)
         else:
             layout.addWidget(QLabel("Cyberpunk 2077 game root")); row=QHBoxLayout(); self.game_path=QLineEdit(self.db.setting("game_root")); self.game_path.setPlaceholderText("Select the directory containing bin/x64"); row.addWidget(self.game_path)
             browse=QPushButton("Browse…"); browse.clicked.connect(self.browse_game); row.addWidget(browse); save=QPushButton("Save path"); save.clicked.connect(self.save_game); row.addWidget(save); layout.addLayout(row)
@@ -102,11 +113,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "profile_combo"): self.refresh_profiles()
         if hasattr(self, "deployment_table"): self.refresh_deployments()
         if hasattr(self, "recovery_table"): self.refresh_recovery()
+        if hasattr(self, "backup_table"): self.refresh_backups()
         if hasattr(self, "dashboard_info"):
             mods = self.library.list_mods()
             active = self.db.setting("active_profile", "default")
             profile = next((p["name"] for p in self.profiles.list_profiles() if p["id"] == active), "Default")
-            self.dashboard_info.setText(f"<b>Cyberpunk 2077</b>　 ·　Profile: {profile}　 ·　Imported mods: {len(mods)}\nGame root: {self.db.setting('game_root', 'Not configured')}\nSelect a deployment after reviewing the mod file paths.")
+            library_status = "Import a ZIP in Mod Library to begin." if not mods else f"Imported mods: {len(mods)}"
+            self.dashboard_info.setText(f"<b>Cyberpunk 2077</b>　 ·　Profile: {profile}　 ·　{library_status}\nGame root: {self.db.setting('game_root', 'Not configured')}\nSelect a deployment after reviewing the destination preview.")
             unresolved_count = len(self.recovery_manager.unresolved())
             if unresolved_count:
                 self.dashboard_info.setText(self.dashboard_info.text() + f"\n<span style='color:#ffbd69'>Recovery needs attention: {unresolved_count} operation(s)</span>")
@@ -122,6 +135,11 @@ class MainWindow(QMainWindow):
                 count=db.execute("SELECT COUNT(*) FROM mod_files WHERE mod_id=?",(mod["id"],)).fetchone()[0]
                 rows.append((mod,count))
         self.mod_table.setRowCount(len(rows))
+        if hasattr(self,"mod_empty"):
+            if rows: self.mod_empty.setText("")
+            elif query: self.mod_empty.setText("No mods match this search.")
+            else: self.mod_empty.setText("Your library is empty. Import a ZIP archive to get started.")
+        self.mod_empty.setVisible(not rows)
         for i,(mod,count) in enumerate(rows):
             vals=[mod["name"],mod.get("version") or "—",mod["imported_at"][:10],Path(mod["archive"]).name,str(count)]
             for j,value in enumerate(vals):
@@ -157,6 +175,7 @@ class MainWindow(QMainWindow):
             check=QTableWidgetItem(); check.setFlags(Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsUserCheckable); check.setCheckState(Qt.CheckState.Checked if mod["enabled"] else Qt.CheckState.Unchecked); check.setData(Qt.ItemDataRole.UserRole,mod["id"]); self.profile_table.setItem(i,0,check)
             for j,val in enumerate([mod["name"],mod["version"] or "—",mod["imported_at"][:10],],1):self.profile_table.setItem(i,j,QTableWidgetItem(val))
         self.profile_table.blockSignals(False)
+        self.profile_empty.setVisible(not mods)
 
     def profile_toggled(self,row:int,column:int) -> None:
         if column!=0:return
@@ -184,29 +203,79 @@ class MainWindow(QMainWindow):
 
     def deploy_profile(self) -> None:
         root=Path(self.db.setting("game_root",""))
+        valid,reason=self.adapter.validate_root(root)
+        if not valid:
+            QMessageBox.warning(self,"Game directory not ready",reason+". Choose a valid Cyberpunk 2077 root in Settings before deploying.")
+            return
         profile=self.db.setting("active_profile","default")
         with self.db.connect() as db:
             rows=db.execute("SELECT m.id,m.extracted_path,m.name,mf.relative_path FROM profile_mods pm JOIN mods m ON m.id=pm.mod_id JOIN mod_files mf ON mf.mod_id=m.id WHERE pm.profile_id=?",(profile,)).fetchall()
-        targets={}; by_mod={}
+        targets={}; by_mod={}; mod_names={}
         for row in rows:
             by_mod.setdefault(row["id"],[]).append(row["relative_path"])
+            mod_names[row["id"]]=row["name"]
             targets.setdefault(row["relative_path"],Path(row["extracted_path"])/row["relative_path"])
         conflicts=detect_conflicts(by_mod)
         if conflicts:
-            QMessageBox.warning(self,"Conflicts block deployment","Resolve duplicate destinations first:\n"+"\n".join(conflicts)); return
+            details=[]
+            for destination,mod_ids in conflicts.items():
+                details.append(f"{destination}\n  " + ", ".join(mod_names.get(mod_id,mod_id) for mod_id in mod_ids))
+            QMessageBox.warning(self,"Conflicts block deployment","These enabled mods target the same destination. Disable one mod in this profile before deploying:\n\n"+"\n\n".join(details)); return
         if not targets:QMessageBox.information(self,"Nothing to deploy","Enable at least one mod in the active profile."); return
-        preview="\n".join(f"{rel}  →  {root / rel}" for rel in targets)
-        answer=QMessageBox.question(self,"Confirm deployment",f"Deploy {len(targets)} files into:\n{root}\n\n{preview}\n\nExisting files will be backed up. Continue?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
-        if answer!=QMessageBox.StandardButton.Yes:return
+        if not self._show_deployment_preview(root,profile,rows,targets):return
         self._run_background("Deploying files; cancellation is unavailable during recovery-safe transaction…",
             lambda: self.deployments.deploy(root,self.adapter,profile,targets),
             lambda uid: QMessageBox.information(self,"Deployment complete",f"Deployment {uid} completed and verified."))
+
+    def _show_deployment_preview(self, root: Path, profile: str, rows, targets: dict[str,Path]) -> bool:
+        dialog=QDialog(self); dialog.setWindowTitle("Deployment preview"); dialog.resize(980,620)
+        layout=QVBoxLayout(dialog)
+        title=QLabel(f"Profile: {self.profile_combo.currentText()}\nGame root: {root}\nReview every destination before confirming.")
+        title.setWordWrap(True); layout.addWidget(title)
+        table=QTableWidget(len(targets),4); table.setHorizontalHeaderLabels(["Mod", "Relative destination", "Game file", "Planned action"]); table.horizontalHeader().setStretchLastSection(True); layout.addWidget(table,1)
+        names={row["relative_path"]:row["name"] for row in rows}
+        blocked=False
+        for index,(relative,source) in enumerate(targets.items()):
+            destination=root.joinpath(*Path(relative).parts)
+            try:
+                cursor=root
+                parts=Path(relative).parts
+                action=None
+                for part_index,part in enumerate(parts):
+                    cursor=cursor/part
+                    try:mode=cursor.lstat().st_mode
+                    except FileNotFoundError:
+                        action="Create new file"
+                        break
+                    if stat.S_ISLNK(mode):
+                        action="Blocked: symbolic link in destination path"
+                        break
+                    if part_index<len(parts)-1 and not stat.S_ISDIR(mode):
+                        action="Blocked: destination parent is not a directory"
+                        break
+                    if part_index==len(parts)-1:
+                        action="Replace; create verified backup" if stat.S_ISREG(mode) else "Blocked: not a regular file"
+                if action is None:action="Blocked: invalid destination path"
+            except OSError:
+                action="Blocked: cannot inspect destination"
+            blocked |= action.startswith("Blocked:")
+            values=[names.get(relative,"Enabled mod"),relative,str(destination),action]
+            for column,value in enumerate(values):table.setItem(index,column,QTableWidgetItem(value))
+        note=QLabel("Existing regular files are backed up before replacement. Unrelated files are left untouched.")
+        note.setObjectName("muted"); layout.addWidget(note)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Yes|QDialogButtonBox.StandardButton.Cancel)
+        deploy_button=buttons.button(QDialogButtonBox.StandardButton.Yes); deploy_button.setText("Deploy")
+        deploy_button.setEnabled(not blocked)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+        return dialog.exec()==QDialog.DialogCode.Accepted
 
     def _run_background(self, label: str, function, on_success, on_error=None) -> None:
         if self.busy:
             QMessageBox.information(self,"Operation in progress","Wait for the current filesystem operation to finish.")
             return
         self.busy = True
+        self.operation_label.setText(label)
+        self.operation_progress.show()
         if hasattr(self,"dashboard_info"):
             self.activity.setText(label)
         worker = FunctionWorker(function)
@@ -216,11 +285,15 @@ class MainWindow(QMainWindow):
 
     def _background_success(self, result, callback) -> None:
         self.busy = False
+        self.operation_progress.hide()
+        self.operation_label.setText("Operation completed")
         callback(result)
         self.refresh()
 
     def _background_failure(self, error: str, on_error=None) -> None:
         self.busy = False
+        self.operation_progress.hide()
+        self.operation_label.setText("Operation needs attention")
         log.error("Background filesystem operation failed: %s",error)
         if on_error:
             on_error(error)
@@ -230,20 +303,42 @@ class MainWindow(QMainWindow):
 
     def refresh_deployments(self) -> None:
         if not hasattr(self,"deployment_table"):return
-        with self.db.connect() as db:rows=db.execute("SELECT d.*,p.name profile FROM deployments d LEFT JOIN profiles p ON p.id=d.profile_id ORDER BY started_at DESC").fetchall()
+        with self.db.connect() as db:rows=db.execute("""SELECT d.*,p.name profile,
+            (SELECT COUNT(*) FROM deployment_files f WHERE f.deployment_id=d.id) file_count
+            FROM deployments d LEFT JOIN profiles p ON p.id=d.profile_id ORDER BY started_at DESC""").fetchall()
         self.deployment_table.setRowCount(len(rows))
+        self.deployment_empty.setVisible(not rows)
         for i,row in enumerate(rows):
-            for j,val in enumerate([row["id"],row["started_at"][:19],row["profile"] or "Deleted profile",row["status"]]):
+            for j,val in enumerate([row["id"],row["started_at"][:19],row["profile"] or "Deleted profile",str(row["file_count"]),row["status"]]):
                 item=QTableWidgetItem(val); item.setData(Qt.ItemDataRole.UserRole,row["id"]); self.deployment_table.setItem(i,j,item)
 
     def refresh_recovery(self) -> None:
         items=self.recovery_manager.unresolved()
         self.recovery_table.setRowCount(len(items))
+        self.recovery_empty.setVisible(not items)
         for i,entry in enumerate(items):
             values=[entry["id"],entry["started_at"][:19] if entry["started_at"]!="unknown" else "unknown",
                     entry["status"],str(len(entry["files"])),entry["issue"]]
             for j,value in enumerate(values):
                 cell=QTableWidgetItem(value); cell.setData(Qt.ItemDataRole.UserRole,entry["id"]); self.recovery_table.setItem(i,j,cell)
+
+    def refresh_backups(self) -> None:
+        with self.db.connect() as db:
+            rows=db.execute("""SELECT d.id,d.started_at,f.existed,f.backup_path
+                FROM deployments d LEFT JOIN deployment_files f ON f.deployment_id=d.id
+                ORDER BY d.started_at DESC""").fetchall()
+        grouped={}
+        for row in rows:
+            entry=grouped.setdefault(row["id"],{"date":row["started_at"][:19],"paths":[]})
+            if row["existed"]: entry["paths"].append(row["backup_path"])
+        self.backup_table.setRowCount(len(grouped)); self.backup_empty.setVisible(not grouped)
+        for i,(deployment_id,entry) in enumerate(grouped.items()):
+            paths=entry["paths"]
+            state="No overwritten files" if not paths else (
+                "Missing — inspect Recovery" if any(not path or Path(path).is_symlink() or not Path(path).is_file() for path in paths) else
+                "Present; hash checked on recovery")
+            for j,value in enumerate([deployment_id,entry["date"],str(len(paths)),state]):
+                self.backup_table.setItem(i,j,QTableWidgetItem(value))
 
     def review_recovery(self) -> None:
         row=self.recovery_table.currentRow()
