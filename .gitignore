@@ -1,0 +1,55 @@
+# Python bytecode and test/lint caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+.venv-local/
+.venv-*/
+venv/
+env/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local databases and SQLite journals/sidecars
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+
+# Runtime state, imported archives, deployments, and backups
+/data/
+/runtime/
+/logs/
+/backups/
+/journals/
+/archives/
+/mods/
+*.log
+*.journal
+*.deployment.json
+
+# Secrets and per-machine environment settings
+.env
+.env.*
+!.env.example
+secrets.*
+credentials.*
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.fleet/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
