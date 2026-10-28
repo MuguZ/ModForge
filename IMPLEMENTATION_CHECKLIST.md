@@ -8,6 +8,6 @@
 - [x] Update README and developer documentation to describe universal support honestly.
 - [x] Add isolated tests for game registry, migrations, Steam parsing, and generic deployment.
 - [x] Run tests and available quality/package checks; review diff.
-- [ ] Commit and push to the configured GitHub remote if remote state and authentication permit.
+- [x] Commit and push to the configured GitHub remote; Git confirmed the update to `main`.
 
 Audit note: baseline `pytest -q` could not start because pytest was not installed. Python 3.14.8 and PySide6 6.12.0 are available. The post-change suite passes in the isolated `.venv`. `git fetch origin` succeeded and `main` matched `origin/main` before this work.
