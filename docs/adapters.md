@@ -12,7 +12,7 @@ Implement `GameAdapter` from `modforge.games.base`:
 - `validate_relative_path(value)`: retain safe relative-path validation; stricter adapters may add rules
 - `supported_locations()`: informational locations only; generic deployment does not require them
 
-An adapter must not bypass `DeploymentManager` path containment, no-follow checks, backup, journaling, or verification. Persisted destination mappings are revalidated by the adapter during deployment. `DeploymentManager.apply_profile` restores the previous successful deployment for that installation before applying the selected profile; it refuses ambiguous external modifications and retains recovery material. This transition consists of multiple durable file transactions, not one filesystem-atomic operation.
+An adapter must not bypass `DeploymentManager` path containment, no-follow checks, backup, journaling, or verification. Persisted destination mappings are revalidated by the adapter during deployment. The versioned database also records deployed-file ownership by game, profile, transaction, fingerprint, and contributing mod IDs. `DeploymentManager.apply_profile` restores the previous successful deployment for that installation before applying the selected profile; it refuses ambiguous external modifications and retains recovery material. This transition consists of multiple durable file transactions, not one filesystem-atomic operation.
 
 The current registry selects the built-in Cyberpunk adapter for Cyberpunk registrations and otherwise uses `GenericFileAdapter`. Third-party entry-point discovery and an adapter compatibility/version protocol are future work; do not install an adapter from an archive or treat untrusted plugin code as safe.
 

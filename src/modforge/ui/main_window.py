@@ -4,7 +4,7 @@ import json
 import stat
 from pathlib import Path
 from PySide6.QtCore import Qt, QThreadPool
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QFormLayout, QTextEdit,
     QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QInputDialog, QDialog, QDialogButtonBox,
     QProgressBar)
@@ -64,8 +64,12 @@ class MainWindow(QMainWindow):
             header.addWidget(self.search)
             button = QPushButton("＋  Import ZIP"); button.setObjectName("primary"); button.clicked.connect(self.import_zip); header.addWidget(button)
             map_button = QPushButton("Map selected mod…"); map_button.clicked.connect(self.edit_mappings); header.addWidget(map_button)
+            details_button = QPushButton("Mod details / metadata…"); details_button.clicked.connect(self.edit_mod_metadata); header.addWidget(details_button)
         if name == "Profiles":
             button = QPushButton("＋  New profile"); button.clicked.connect(self.create_profile); header.addWidget(button)
+            export_button=QPushButton("Export…"); export_button.clicked.connect(self.export_profile); header.addWidget(export_button)
+            import_button=QPushButton("Import…"); import_button.clicked.connect(self.import_profile); header.addWidget(import_button)
+            compare_button=QPushButton("Compare…"); compare_button.clicked.connect(self.compare_profile); header.addWidget(compare_button)
         layout.addLayout(header)
         if name == "Dashboard":
             self.dashboard_info = QLabel(); self.dashboard_info.setWordWrap(True); self.dashboard_info.setObjectName("muted"); layout.addWidget(self.dashboard_info)
@@ -85,7 +89,7 @@ class MainWindow(QMainWindow):
             self.games_table=QTableWidget(0,5); self.games_table.setHorizontalHeaderLabels(["Game", "Installation", "Status", "Strategy", "Source"]); self.games_table.horizontalHeader().setStretchLastSection(True); self.games_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); layout.addWidget(self.games_table,1)
             self.game_status = QLabel("Generic file-based management is available without a dedicated adapter. Game and mod compatibility remains game-specific."); self.game_status.setObjectName("muted"); self.game_status.setWordWrap(True); layout.addWidget(self.game_status)
         elif name == "Mod Library":
-            self.mod_table = QTableWidget(0,5); self.mod_table.setHorizontalHeaderLabels(["Mod", "Version", "Imported", "Archive", "Files"]); self.mod_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.mod_table,1)
+            self.mod_table = QTableWidget(0,6); self.mod_table.setHorizontalHeaderLabels(["Mod", "Version", "Status", "Imported", "Archive", "Files"]); self.mod_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.mod_table,1)
             self.mod_empty = QLabel("Your library is empty. Import a ZIP archive to get started."); self.mod_empty.setObjectName("muted"); self.mod_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.mod_empty)
             self.mod_table.cellDoubleClicked.connect(self.show_mod_contents)
         elif name == "Profiles":
@@ -110,6 +114,7 @@ class MainWindow(QMainWindow):
             self.backup_table = QTableWidget(0,4); self.backup_table.setHorizontalHeaderLabels(["Deployment ID", "Created", "Files", "Snapshot status"]); self.backup_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.backup_table,1)
             self.backup_empty = QLabel("No deployment snapshots yet."); self.backup_empty.setObjectName("muted"); self.backup_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.backup_empty)
             retained = QLabel("Snapshots remain available after rollback."); retained.setObjectName("muted"); layout.addWidget(retained)
+            restore=QPushButton("Restore selected transaction…"); restore.clicked.connect(self.rollback_backup_selected); layout.addWidget(restore,alignment=Qt.AlignmentFlag.AlignLeft)
         else:
             layout.addWidget(QLabel("Game installations are managed from the Games page. Select a registered game as active before previewing deployment."));
             layout.addWidget(QLabel(f"Application data: {self.paths.data}\nConfiguration: {self.paths.config}\nLogs: {self.paths.state}")); open_logs=QPushButton("Open logs folder"); open_logs.clicked.connect(lambda: self.open_folder(self.paths.state)); layout.addWidget(open_logs,alignment=Qt.AlignmentFlag.AlignLeft); layout.addStretch()
@@ -132,7 +137,14 @@ class MainWindow(QMainWindow):
             game=self._active_game()
             scoped_profiles=self.profiles.list_profiles(game["id"] if game else None)
             profile = next((p["name"] for p in scoped_profiles if p["id"] == active), "Default")
-            library_status = "Import a ZIP in Mod Library to begin." if not mods else f"Imported mods: {len(mods)}"
+            enabled_count=0;deployed_count=0
+            if game:
+                with self.db.connect() as db:
+                    enabled_count=db.execute("SELECT COUNT(*) FROM profile_mods WHERE profile_id=?",(active,)).fetchone()[0]
+                    owner_rows=db.execute("SELECT mod_ids FROM deployed_file_owners WHERE game_id=? AND status='active'",(game["id"],)).fetchall()
+                deployed_ids={mod_id for owner in owner_rows for mod_id in json.loads(owner["mod_ids"])}
+                deployed_count=len(deployed_ids)
+            library_status=f"{enabled_count} enabled · {deployed_count} deployed · {len(mods)} in library" if mods else "Import a ZIP in Mod Library to begin."
             game_label=game["name"] if game else "No game selected"
             game_root=game["root"] if game else "Register a game on the Games page"
             deployed="No successful deployment for this game yet"
@@ -287,18 +299,26 @@ class MainWindow(QMainWindow):
         mods = self.library.list_mods(); query = self.search.text().casefold() if hasattr(self,"search") else ""
         with self.db.connect() as db:
             rows=[]
+            active_profile=self._active_profile_id();game=self._active_game()
+            enabled={entry[0] for entry in db.execute("SELECT mod_id FROM profile_mods WHERE profile_id=?",(active_profile,))}
+            deployed=set()
+            if game:
+                owner_rows=db.execute("SELECT mod_ids FROM deployed_file_owners WHERE game_id=? AND status='active'",(game["id"],)).fetchall()
+                deployed={mod_id for owner in owner_rows for mod_id in json.loads(owner["mod_ids"])}
             for mod in mods:
                 if query and query not in mod["name"].casefold(): continue
                 count=db.execute("SELECT COUNT(*) FROM mod_files WHERE mod_id=?",(mod["id"],)).fetchone()[0]
-                rows.append((mod,count))
+                status="Missing" if not Path(mod["extracted_path"]).is_dir() else (
+                    "Deployed" if mod["id"] in deployed else "Enabled in profile" if mod["id"] in enabled else "Imported")
+                rows.append((mod,count,status))
         self.mod_table.setRowCount(len(rows))
         if hasattr(self,"mod_empty"):
             if rows: self.mod_empty.setText("")
             elif query: self.mod_empty.setText("No mods match this search.")
             else: self.mod_empty.setText("Your library is empty. Import a ZIP archive to get started.")
         self.mod_empty.setVisible(not rows)
-        for i,(mod,count) in enumerate(rows):
-            vals=[mod["name"],mod.get("version") or "—",mod["imported_at"][:10],Path(mod["archive"]).name,str(count)]
+        for i,(mod,count,status) in enumerate(rows):
+            vals=[mod["name"],mod.get("version") or "—",status,mod["imported_at"][:10],Path(mod["archive"]).name,str(count)]
             for j,value in enumerate(vals):
                 cell=QTableWidgetItem(value); cell.setData(Qt.ItemDataRole.UserRole,mod["id"]); self.mod_table.setItem(i,j,cell)
 
@@ -327,6 +347,39 @@ class MainWindow(QMainWindow):
         with self.db.connect() as db: files=db.execute("SELECT relative_path,size FROM mod_files WHERE mod_id=? ORDER BY relative_path",(mod_id,)).fetchall()
         text="\n".join(f"{r['relative_path']}  ({r['size']} bytes)" for r in files)
         QMessageBox.information(self,"Archive contents and destination preview",text or "No files")
+
+    def edit_mod_metadata(self) -> None:
+        row=self.mod_table.currentRow()
+        if row<0:
+            QMessageBox.information(self,"Select a mod","Select a library entry first."); return
+        mod_id=self.mod_table.item(row,0).data(Qt.ItemDataRole.UserRole)
+        mod=next((item for item in self.library.list_mods() if item["id"]==mod_id),None)
+        if not mod:return
+        dialog=QDialog(self);dialog.setWindowTitle(f"Mod details — {mod['name']}");dialog.resize(700,650)
+        layout=QVBoxLayout(dialog);form=QFormLayout()
+        fields={}
+        for key,label in (("name","Name"),("version","Version"),("author","Author"),("source_url","Source URL"),("category","Category"),("tags","Tags (comma separated)")):
+            field=QLineEdit(mod.get(key) or "");fields[key]=field;form.addRow(label,field)
+        description=QTextEdit(mod.get("description") or "");fields["description"]=description;form.addRow("Description",description)
+        notes=QTextEdit(mod.get("notes") or "");fields["notes"]=notes;form.addRow("Notes",notes)
+        layout.addLayout(form)
+        with self.db.connect() as db:
+            manifest=db.execute("SELECT relative_path,size,sha256 FROM mod_files WHERE mod_id=? ORDER BY relative_path",(mod_id,)).fetchall()
+        info=QLabel(f"Imported: {mod['imported_at']}\nArchive SHA-256: {mod['archive_hash']}\nManaged files: {len(manifest)}")
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);layout.addWidget(info)
+        file_table=QTableWidget(len(manifest),3);file_table.setHorizontalHeaderLabels(["Imported file","Bytes","SHA-256"]);file_table.horizontalHeader().setStretchLastSection(True);layout.addWidget(file_table,1)
+        for index,item in enumerate(manifest):
+            for column,value in enumerate((item["relative_path"],str(item["size"]),item["sha256"])):
+                file_table.setItem(index,column,QTableWidgetItem(value))
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:return
+        try:
+            self.library.update_metadata(mod_id,name=fields["name"].text(),version=fields["version"].text(),
+                author=fields["author"].text(),source_url=fields["source_url"].text(),category=fields["category"].text(),
+                tags=fields["tags"].text(),description=description.toPlainText(),notes=notes.toPlainText())
+            self.refresh_mod_table()
+        except Exception as exc:QMessageBox.warning(self,"Metadata not saved",str(exc))
 
     def edit_mappings(self) -> None:
         row=self.mod_table.currentRow()
@@ -405,6 +458,51 @@ class MainWindow(QMainWindow):
             self.refresh_profiles()
         except Exception as exc:QMessageBox.warning(self,"Profile not deleted",str(exc))
 
+    def export_profile(self) -> None:
+        if not self.profile_combo.count():return
+        filename,_=QFileDialog.getSaveFileName(self,"Export profile",str(Path.home()/"modforge-profile.json"),"ModForge profiles (*.json)")
+        if not filename:return
+        try:
+            definition=self.profiles.export_definition(self.profile_combo.currentData())
+            Path(filename).write_text(json.dumps(definition,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+            QMessageBox.information(self,"Profile exported",f"Profile definition saved to {filename}. No game files were changed.")
+        except Exception as exc:QMessageBox.warning(self,"Profile export failed",str(exc))
+
+    def import_profile(self) -> None:
+        game=self._active_game()
+        if not game:
+            QMessageBox.warning(self,"No game selected","Select a game before importing a profile.");return
+        filename,_=QFileDialog.getOpenFileName(self,"Import profile",str(Path.home()),"ModForge profiles (*.json)")
+        if not filename:return
+        try:
+            path=Path(filename)
+            if path.stat().st_size>4*1024*1024:raise ValueError("Profile file is too large")
+            definition=json.loads(path.read_text(encoding="utf-8"))
+            profile_id=self.profiles.import_definition(definition,game["id"])
+            self.refresh_profiles();index=self.profile_combo.findData(profile_id)
+            if index>=0:self.profile_combo.setCurrentIndex(index)
+            QMessageBox.information(self,"Profile imported","Profile configuration imported. Review the deployment preview before applying it.")
+        except Exception as exc:QMessageBox.warning(self,"Profile import failed",str(exc))
+
+    def compare_profile(self) -> None:
+        if not self.profile_combo.count():return
+        game=self._active_game()
+        profiles=self.profiles.list_profiles(game["id"] if game else None)
+        current=self.profile_combo.currentData()
+        choices=[p for p in profiles if p["id"]!=current]
+        if not choices:
+            QMessageBox.information(self,"No comparison profile","Create another profile for this game to compare settings.");return
+        labels=[p["name"] for p in choices]
+        selected,ok=QInputDialog.getItem(self,"Compare profiles","Compare current profile with",labels,0,False)
+        if not ok:return
+        other=choices[labels.index(selected)]
+        try:
+            result=self.profiles.compare(current,other["id"])
+            QMessageBox.information(self,"Profile comparison",
+                f"Only in {selected}:\n"+("\n".join(result["added"]) or "None")+
+                f"\n\nOnly in {self.profile_combo.currentText()}:\n"+("\n".join(result["removed"]) or "None"))
+        except Exception as exc:QMessageBox.warning(self,"Profile comparison failed",str(exc))
+
     def deploy_profile(self) -> None:
         root,adapter=self._game_context()
         if root is None:
@@ -428,9 +526,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self,"Mod source unavailable",str(exc)); return
         by_mod={}; mod_names={}
+        owners={}
         for row in rows:
             by_mod.setdefault(row["id"],[]).append(row["relative_path"])
             mod_names[row["id"]]=row["name"]
+            owners.setdefault(row["relative_path"],[]).append(row["id"])
         conflicts=detect_conflicts(by_mod)
         if conflicts:
             details=[]
@@ -444,7 +544,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self,"Nothing to deploy","Enable at least one mod in the active profile."); return
         if not self._show_deployment_preview(root,profile,rows,targets,game["id"]):return
         self._run_background("Applying profile transaction; cancellation is unavailable during recovery-safe operations…",
-            lambda: self.deployments.apply_profile(root,adapter,profile,targets,game_id=game["id"]),
+            lambda: self.deployments.apply_profile(root,adapter,profile,targets,game_id=game["id"],owners=owners),
             lambda uid: QMessageBox.information(self,"Profile applied",f"Deployment {uid} completed and verified." if uid else "Managed files from the previous profile were safely restored."))
 
     def _show_deployment_preview(self, root: Path, profile: str, rows, targets: dict[str,Path], game_id: str | None = None) -> bool:
@@ -624,7 +724,15 @@ class MainWindow(QMainWindow):
     def rollback_selected(self) -> None:
         row=self.deployment_table.currentRow()
         if row<0:return
-        uid=self.deployment_table.item(row,0).text()
+        self._rollback_deployment(self.deployment_table.item(row,0).text())
+
+    def rollback_backup_selected(self) -> None:
+        row=self.backup_table.currentRow()
+        if row<0:
+            QMessageBox.information(self,"Select a snapshot","Select a deployment snapshot first.");return
+        self._rollback_deployment(self.backup_table.item(row,0).text())
+
+    def _rollback_deployment(self,uid: str) -> None:
         try:root,adapter=self._deployment_context(uid)
         except Exception as exc:
             QMessageBox.warning(self,"Cannot roll back deployment",str(exc)); return

@@ -236,9 +236,9 @@ class RecoveryManager:
             row = db.execute("SELECT id FROM deployments WHERE id=?", (payload["id"],)).fetchone()
             finished = payload.get("finished_at", payload.get("started_at"))
             if not row:
-                db.execute("INSERT INTO deployments(id,profile_id,started_at,finished_at,status,journal,message) VALUES(?,?,?,?,?,?,?)",
+                db.execute("INSERT INTO deployments(id,profile_id,started_at,finished_at,status,journal,message,game_id) VALUES(?,?,?,?,?,?,?,?)",
                            (payload["id"], payload.get("profile_id"), payload.get("started_at", finished),
-                            finished, expected_status, str(journal_path), "reconciled from durable journal"))
+                            finished, expected_status, str(journal_path), "reconciled from durable journal",payload.get("game_id")))
             else:
                 db.execute("UPDATE deployments SET status=?,finished_at=? WHERE id=?",
                            (expected_status, finished, payload["id"]))
@@ -250,6 +250,15 @@ class RecoveryManager:
             ])
             db.execute("UPDATE deployment_files SET status=? WHERE deployment_id=?",
                        (file_status, payload["id"]))
+            db.execute("UPDATE deployed_file_owners SET status=?,updated_at=datetime('now') WHERE deployment_id=?",
+                       ("active" if expected_status == "success" else "rolled_back", payload["id"]))
+            if expected_status == "success" and payload.get("game_id"):
+                db.executemany("""INSERT OR REPLACE INTO deployed_file_owners
+                    (game_id,relative_path,deployment_id,profile_id,mod_ids,fingerprint,status,updated_at)
+                    VALUES(?,?,?,?,?,?,'active',datetime('now'))""",
+                    [(payload["game_id"],record["path"],payload["id"],payload.get("profile_id"),
+                      json.dumps(record.get("mod_ids",[])),record["deployed_hash"])
+                     for record in payload["files"] if record.get("mod_ids")])
         self._cleanup_stage(payload)
         return {"id": payload["id"], "status": expected_status, "restored": [], "errors": []}
 

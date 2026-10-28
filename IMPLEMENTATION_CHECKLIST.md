@@ -1,41 +1,55 @@
-# ModForge Phase 2 checklist
+# ModForge Phase 2 implementation status
 
-## Audit and baseline
+## Audit and base state
 
-- [x] Verify branch, remote, working tree, package configuration, source, tests, and docs.
-- [x] Confirm post-Phase-1 baseline: 37 pytest tests passed and wheel built; local branch was `main` at `5ec9d6e`.
-- [x] Fetch remote references before commit/push. Escalated fetch succeeded; local `main` and `origin/main` matched before this phase's commit.
-- [x] Confirm schema v2 and identify global profile selection, unassociated deployment rows, and archive paths deploying without a mapping layer.
+- [x] Inspect repository, configuration, source, migrations, UI, docs, tests, and Git state.
+- [x] Phase 2 baseline at commit `5ec9d6e`: 37 tests passed; wheel built; Python 3.14.8/PySide6 6.12.
+- [x] Compare remote before work: `main` matched `origin/main` at `5ec9d6e`.
+- [x] Preserve Phase 2 commit `7c69b67`; it is local and still needs to be pushed.
 
-## Implemented in this phase
+## Domain, migrations, and profiles
 
-- [x] Add schema v3 game associations for profiles/deployments and a per-game mod destination mapping table.
-- [x] Preserve v1/v2 data through additive migration; associate sole-game legacy records and clone profile memberships when multiple installations exist.
-- [x] Give every game a separate default profile and isolate profile listing, enabled states, and active-profile settings by game.
-- [x] Persist source-to-destination mappings and validate relative paths/collisions through the selected adapter.
-- [x] Preview ZIP contents before extraction/import; add archive nesting limits and file/directory conflict checks.
-- [x] Reject managed source paths with symlink components before they reach deployment.
-- [x] Scope deployment collisions/history by game installation; bind transactions to game IDs and recorded roots.
-- [x] Add profile application with reverse-order rollback, deployment, compensation on safely recovered failures, and recovery blocking for external file changes.
-- [x] Show prior-profile removals/restores in deployment preview; preserve external edits and unrelated files.
-- [x] Make game registration removal reversible by disabling it, preserving profiles, mappings, transactions, backups, journals, and game files.
-- [x] Add regression tests for migrations, mappings, per-game profiles/deployments, profile transition/disable, failure compensation, external modifications, and UI preview.
-- [x] Add CI jobs for Python 3.11–3.14, offscreen pytest, and wheel build.
-- [x] Update usage, adapter, security, and limitation documentation.
+- [x] Schema v3 game-scoped profiles/deployments and per-game mappings.
+- [x] Schema v4 persistent deployed-file ownership (game, path, transaction, profile, mod IDs, fingerprint, status).
+- [x] Schema v5 optional mod metadata columns and indexes.
+- [x] Additive migrations preserve IDs, mod membership, game records, and deployment records; tests migrate a representative v1 database to v5.
+- [x] Isolated default profiles, membership, active profile setting, profile comparison, and JSON import/export.
+- [x] Game registration disable/re-enable preserves related data instead of cascading deletion.
 
-## Verification and release
+## Import, mappings, and deployment
 
-- [x] Run full tests, compilation, wheel build, editable install, startup smoke, and `git diff --check` after final changes.
-- [x] Review the source/test/docs/workflow file set; generated artifacts, credentials, and game files are excluded.
-- [ ] Commit and push to `main` only after remote state is verified.
+- [x] ZIP preflight preview without extraction; bounded paths, depth, count, expanded-size, compression ratio, links/special files, and file/directory conflicts are checked.
+- [x] ZIP content is extracted into managed storage only after explicit import confirmation.
+- [x] Persist per-game, per-file source-to-destination mappings with adapter path checks and collision rejection.
+- [ ] Directory-prefix mapping rules, auto-suggestions, and adapter layout suggestions.
+- [x] Validate managed source containment and reject symlink path components.
+- [x] Profile apply rolls back old successful operations, applies the selected manifest, safely compensates recovered failures, and refuses externally modified files.
+- [x] Per-file owner rows are committed/reconciled with deployment state and marked rolled back during recovery.
+- [x] Preview includes previous managed files that will be restored/removed; unowned files remain preserved.
+- [ ] One journaled transaction for the entire profile transition; current flow uses durable sub-transactions and recovery material.
 
-## Remaining limitations
+## Library, UI, and Linux
 
-- [ ] Mod library metadata/version editing, update workflow, profile import/export/comparison, and standalone backup restore UI.
-- [ ] Explicit file ownership table and per-file owner attribution across concurrently active mods.
-- [ ] Single journaled transaction spanning profile rollback plus re-deployment; current transition has durable sub-transactions and a recovery path.
-- [ ] Symlink/hardlink/adapter deployment strategies, launcher execution, Proton prefix awareness, Lutris/Heroic, dependencies, online providers, and specialized Far Cry 3/Sekiro loaders.
-- [ ] Full import wizard with directory-level mapping rules and adapter-generated suggestions; current UI previews files and supports per-file mappings.
-- [ ] Formatter, linter, and type checker; the repository did not previously configure these tools.
+- [x] Edit optional mod name/version/author/description/source URL/category/tags/notes; show archive checksum and file manifest.
+- [x] Display imported/enabled/deployed/missing mod state; dashboard reports enabled and deployed counts.
+- [x] Export/import and compare per-game profile definitions; import validates local archive checksums and does not accept paths.
+- [x] Backups page can invoke safe transaction rollback.
+- [x] Steam discovery and XDG path support from Phase 1 remain covered; generic file deployment and Cyberpunk root validation are distinct.
+- [ ] Local mod version update/candidate workflow and safe library uninstall.
+- [ ] Per-file restore UI, backup retention/usage reporting, profile restore point, dependency/incompatibility metadata.
+- [ ] Launcher execution, Proton prefix detection, Lutris/Heroic, network providers, symlink/hardlink strategies, and specialized Far Cry 3/Sekiro adapters.
+- [ ] Full storage relocation workflow, diagnostics export, first-run wizard, and runtime load-order support.
 
-Tests use temporary game roots and fixture archives/manifests. Never point automated tests at installed games, Proton prefixes, personal mod libraries, or existing backups.
+## QA, documentation, release
+
+- [x] Add migration, mapping, owner lifecycle/recovery, profile transition, archive security, UI preview, and cross-game tests.
+- [x] Add CI for Python 3.11–3.14, offscreen pytest, and wheel build.
+- [x] Update README and adapter documentation with verified behavior and limitations.
+- [x] Final suite after continuation edits: 54 tests pass; `compileall` passes.
+- [x] Build wheel with `pip wheel . --no-deps --no-build-isolation`; wheel created successfully.
+- [x] Offscreen launch smoke reaches the Qt event loop with isolated `/tmp` XDG directories (timeout exit 124 is expected for a running GUI).
+- [x] `git diff --check` passes; tests use disposable roots and smoke data stayed under `/tmp`.
+- [ ] Formatting/lint/type checks: no formatter, linter, or type checker is configured or installed in the development environment.
+- [ ] Stage and review release files; fetch remote; commit continuation work and push both commits to `main`.
+
+All deployment tests use temporary game roots. Do not target installed games, Proton prefixes, user libraries, archives, or existing backups.

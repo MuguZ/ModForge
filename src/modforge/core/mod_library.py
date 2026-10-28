@@ -37,6 +37,23 @@ class ModLibrary:
         with self.db.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM mods ORDER BY imported_at DESC")]
 
+    def update_metadata(self, mod_id: str, *, name: str, version: str = "", author: str = "",
+                        description: str = "", source_url: str = "", category: str = "",
+                        tags: str = "", notes: str = "") -> None:
+        name = " ".join(name.split())
+        if not name or len(name) > 200:
+            raise ValueError("Mod name must contain between 1 and 200 characters")
+        values = [value.strip() for value in (version, author, description, source_url, category, tags, notes)]
+        if len(description) > 20_000 or any(len(value) > 2_000 for value in values):
+            raise ValueError("Mod metadata exceeds the supported text length")
+        with self.db.connect() as db:
+            changed = db.execute("""UPDATE mods SET name=?,version=?,author=?,description=?,source_url=?,
+                category=?,tags=?,notes=?,updated_at=? WHERE id=?""",
+                (name, version.strip(), author.strip(), description, source_url.strip(), category.strip(),
+                 tags.strip(), notes.strip(), datetime.now(timezone.utc).isoformat(timespec="seconds"), mod_id)).rowcount
+            if not changed:
+                raise ValueError("Mod was not found")
+
     def file_manifest(self, profile_id: str) -> dict[str, Path]:
         with self.db.connect() as db:
             rows = db.execute("""SELECT mf.relative_path,m.extracted_path FROM profile_mods pm

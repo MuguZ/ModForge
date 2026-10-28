@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 class Database:
@@ -127,6 +127,33 @@ class Database:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(game_id,mod_id,source_path))""")
                 db.execute("PRAGMA user_version=3")
+                version = 3
+            if version < 4:
+                db.execute("""CREATE TABLE IF NOT EXISTS deployed_file_owners(
+                    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE RESTRICT,
+                    relative_path TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+                    profile_id TEXT,
+                    mod_ids TEXT NOT NULL DEFAULT '[]',
+                    fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(game_id,relative_path))""")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_file_owners_deployment ON deployed_file_owners(deployment_id,status)")
+                db.execute("PRAGMA user_version=4")
+                version = 4
+            if version < 5:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(mods)")}
+                for column, declaration in {
+                    "source_url": "TEXT", "category": "TEXT", "tags": "TEXT NOT NULL DEFAULT ''",
+                    "updated_at": "TEXT NOT NULL DEFAULT ''",
+                }.items():
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE mods ADD COLUMN {column} {declaration}")
+                db.execute("UPDATE mods SET updated_at=imported_at WHERE updated_at='' ")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_mods_name ON mods(name COLLATE NOCASE)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_profile_mods_mod ON profile_mods(mod_id,profile_id)")
+                db.execute("PRAGMA user_version=5")
 
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as db:

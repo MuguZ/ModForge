@@ -80,7 +80,8 @@ class DeploymentManager:
         self.lock_dir = lock_dir.resolve()
 
     def deploy(self, root: Path, adapter: GameAdapter, profile_id: str,
-               manifest: dict[str, Path], game_id: str | None = None) -> str:
+               manifest: dict[str, Path], game_id: str | None = None,
+               owners: dict[str, list[str]] | None = None) -> str:
         ok, reason = adapter.validate_root(root)
         if not ok:
             raise DeploymentError(reason)
@@ -112,10 +113,12 @@ class DeploymentManager:
             paths[rel] = source
         lock_path = self._lock_path(root)
         with locked_file(lock_path):
-            return self._deploy_locked(root, adapter, profile_id, paths, game_id)
+            normalized_owners = {adapter.validate_relative_path(path): ids for path, ids in (owners or {}).items()}
+            return self._deploy_locked(root, adapter, profile_id, paths, game_id, normalized_owners)
 
     def apply_profile(self, root: Path, adapter: GameAdapter, profile_id: str,
-                      manifest: dict[str, Path], game_id: str) -> str | None:
+                      manifest: dict[str, Path], game_id: str,
+                      owners: dict[str, list[str]] | None = None) -> str | None:
         """Safely replace this game's active ModForge deployment with a profile.
 
         Existing successful transactions for the same registered game are rolled
@@ -127,6 +130,7 @@ class DeploymentManager:
             raise DeploymentError(reason)
         root = root.resolve(strict=True)
         paths = {}
+        normalized_owners = {}
         folded = set()
         for raw, source in manifest.items():
             try:
@@ -140,6 +144,10 @@ class DeploymentManager:
             if source.is_symlink() or not source.is_file():
                 raise DeploymentError(f"Invalid or symbolic-link source file: {source}")
             paths[relative] = source
+            mod_ids=(owners or {}).get(raw, [])
+            if not isinstance(mod_ids,list) or any(not isinstance(mod_id,str) for mod_id in mod_ids):
+                raise DeploymentError(f"Invalid mod ownership list for {relative}")
+            normalized_owners[relative] = list(mod_ids)
         with self.db.connect() as db:
             game = db.execute("SELECT root,enabled FROM games WHERE id=?", (game_id,)).fetchone()
             profile = db.execute("SELECT game_id FROM profiles WHERE id=?", (profile_id,)).fetchone()
@@ -147,6 +155,10 @@ class DeploymentManager:
                 raise DeploymentError("Selected game registration does not match the deployment root")
             if not profile or profile["game_id"] != game_id:
                 raise DeploymentError("Profile is not associated with the selected game")
+            profile_mods={row[0] for row in db.execute("SELECT mod_id FROM profile_mods WHERE profile_id=?",(profile_id,))}
+            for relative,mod_ids in normalized_owners.items():
+                if relative not in paths or not set(mod_ids).issubset(profile_mods):
+                    raise DeploymentError(f"Ownership metadata does not match enabled mods for {relative}")
             unfinished = db.execute("SELECT id,status FROM deployments WHERE game_id=? AND status NOT IN ('success','rolled_back','failed_recovered')",
                                     (game_id,)).fetchall()
             if unfinished:
@@ -154,6 +166,7 @@ class DeploymentManager:
             rows = db.execute("SELECT id,journal,profile_id FROM deployments WHERE game_id=? AND status='success' ORDER BY started_at DESC",
                               (game_id,)).fetchall()
         old_manifest = {}
+        old_owners = {}
         transactions = []
         old_profile = rows[0]["profile_id"] if rows else profile_id
         # Validate all recovery material and source files before the first live change.
@@ -177,6 +190,7 @@ class DeploymentManager:
                 if relative in old_manifest:
                     raise DeploymentError(f"Previous deployments overlap at {relative}; inspect Recovery")
                 old_manifest[relative] = source
+                old_owners[relative] = list(record.get("mod_ids", []))
             transactions.append(row["id"])
         lock_path = self._lock_path(root)
         with locked_file(lock_path):
@@ -189,12 +203,12 @@ class DeploymentManager:
                 all_previous_rolled_back = True
                 if not paths:
                     return None
-                return self._deploy_locked(root, adapter, profile_id, paths, game_id)
+                return self._deploy_locked(root, adapter, profile_id, paths, game_id, normalized_owners)
             except Exception as exc:
                 safely_reapply = all_previous_rolled_back and "inspect Recovery" not in str(exc)
                 if safely_reapply and old_manifest:
                     try:
-                        self._deploy_locked(root, adapter, old_profile or profile_id, old_manifest, game_id)
+                        self._deploy_locked(root, adapter, old_profile or profile_id, old_manifest, game_id, old_owners)
                     except Exception as restore_exc:
                         raise DeploymentError(
                             f"Profile transition failed ({exc}); restoring the previous profile also failed ({restore_exc}). Inspect Recovery."
@@ -211,7 +225,8 @@ class DeploymentManager:
         return self.lock_dir / (hashlib.sha256(str(root).encode()).hexdigest() + ".lock")
 
     def _deploy_locked(self, root: Path, adapter: GameAdapter, profile_id: str,
-                       manifest: dict[str, Path], game_id: str | None = None) -> str:
+                       manifest: dict[str, Path], game_id: str | None = None,
+                       owners: dict[str, list[str]] | None = None) -> str:
         with self.db.connect() as db:
             for rel in manifest:
                 rows = db.execute("""SELECT df.relative_path FROM deployment_files df
@@ -242,6 +257,7 @@ class DeploymentManager:
                 "original_hash": original_hash,
                 "backup_path": str(backup_root.joinpath(*PurePosixPath(rel).parts)) if exists else None,
                 "deployed_hash": file_hash(source),
+                "mod_ids": list((owners or {}).get(rel, [])),
                 "status": "planned",
             })
 
@@ -342,6 +358,14 @@ class DeploymentManager:
                 db.execute("UPDATE deployments SET status='success',finished_at=? WHERE id=?",
                            (payload["finished_at"], deployment_id))
                 db.execute("UPDATE deployment_files SET status='deployed' WHERE deployment_id=?", (deployment_id,))
+                if game_id:
+                    stamp = datetime.now(timezone.utc).isoformat()
+                    db.executemany("""INSERT OR REPLACE INTO deployed_file_owners
+                        (game_id,relative_path,deployment_id,profile_id,mod_ids,fingerprint,status,updated_at)
+                        VALUES(?,?,?,?,?,?,'active',?)""",
+                        [(game_id, record["path"], deployment_id, profile_id,
+                          json.dumps(record.get("mod_ids", [])), record["deployed_hash"], stamp)
+                         for record in records if record.get("mod_ids")])
             try:
                 self._safe_cleanup_stage(stage_root)
             except OSError:

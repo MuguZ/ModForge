@@ -11,6 +11,8 @@ from modforge.core import deployment_manager, recovery_manager
 from modforge.core.deployment_manager import DeploymentError
 from modforge.core.recovery_manager import RecoveryError, RecoveryManager
 from modforge.core.rollback_manager import RollbackManager
+from modforge.core.profile_manager import ProfileManager
+from modforge.games.registry import GameRegistry
 
 
 class SimulatedProcessExit(BaseException):
@@ -146,6 +148,8 @@ def test_hash_verification_failure_recovers(services, tmp_path, monkeypatch):
 
 def test_database_finalization_failure_is_visible_and_reconcilable(services, tmp_path, monkeypatch):
     db, deployer, recovery, root, adapter, _ = make_manager(services)
+    game_id=GameRegistry(db).register("Finalize ownership",root)
+    profile_id=ProfileManager(db).list_profiles(game_id)[0]["id"]
     source = tmp_path / "mod"
     source.write_text("deployed")
     original_connect = db.connect
@@ -170,7 +174,8 @@ def test_database_finalization_failure_is_visible_and_reconcilable(services, tmp
 
     monkeypatch.setattr(db, "connect", fail_finalization)
     with pytest.raises(DeploymentError, match="inspect Recovery"):
-        deployer.deploy(root, adapter, "default", {"r6/scripts/a.lua": source})
+        deployer.deploy(root, adapter, profile_id, {"r6/scripts/a.lua": source},game_id=game_id,
+                        owners={"r6/scripts/a.lua":["fixture-mod"]})
     deployment_id = (deployer.journals / next(deployer.journals.glob("*.json")).name).stem
     assert (root / "r6/scripts/a.lua").read_text() == "deployed"
     monkeypatch.setattr(db, "connect", original_connect)
@@ -178,6 +183,8 @@ def test_database_finalization_failure_is_visible_and_reconcilable(services, tmp
     assert result["status"] == "success"
     with db.connect() as connection:
         assert connection.execute("SELECT status FROM deployments WHERE id=?", (deployment_id,)).fetchone()[0] == "success"
+        owner=connection.execute("SELECT status,mod_ids FROM deployed_file_owners WHERE game_id=? AND relative_path='r6/scripts/a.lua'",(game_id,)).fetchone()
+        assert owner["status"]=="active" and owner["mod_ids"]=='["fixture-mod"]'
 
 
 def test_recovery_refuses_parent_symlink_swap(services, tmp_path, monkeypatch):
@@ -211,7 +218,7 @@ def test_database_v1_reopen_preserves_existing_schema(services):
     from modforge.database import Database
     reopened = Database(db.path)
     with reopened.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT COUNT(*) FROM deployments").fetchone()[0] == 0
 
 
@@ -407,7 +414,7 @@ def test_legacy_schema_less_journal_loads(services, tmp_path):
 def test_previous_database_schema_opens_without_loss(services):
     db, *_ = services
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute("SELECT name FROM profiles WHERE id='default'").fetchone()[0] == "Default"
     reopened = type(db)(db.path)
     with reopened.connect() as conn:

@@ -45,7 +45,7 @@ def test_migration_preserves_legacy_game_root(tmp_path):
         connection.execute("PRAGMA user_version=1")
     reopened = Database(db_path)
     with reopened.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     game = GameRegistry(reopened).get("legacy-cyberpunk2077")
     assert game["root"] == str(tmp_path / "Cyberpunk")
     assert game["adapter_id"] == "cyberpunk2077"
@@ -80,11 +80,48 @@ def test_migration_from_existing_schema_preserves_profile_mod_and_deployment_ids
     connection.commit(); connection.close()
     migrated=Database(path)
     with migrated.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0]==3
+        assert db.execute("PRAGMA user_version").fetchone()[0]==5
         profile=db.execute("SELECT game_id,is_default FROM profiles WHERE id='default'").fetchone()
         assert tuple(profile)==("game-1",1)
         assert db.execute("SELECT mod_id FROM profile_mods WHERE profile_id='default'").fetchone()[0]=="mod-1"
         assert db.execute("SELECT game_id FROM deployments WHERE id='deploy-1'").fetchone()[0]=="game-1"
+
+
+def test_v2_multi_game_migration_clones_profile_state_without_cross_game_sharing(tmp_path):
+    import sqlite3
+    path=tmp_path/"schema-v2.sqlite3";connection=sqlite3.connect(path)
+    connection.executescript("""
+      CREATE TABLE games(id TEXT PRIMARY KEY,name TEXT NOT NULL,root TEXT,executable TEXT,launcher TEXT,
+        platform TEXT NOT NULL DEFAULT 'linux',source TEXT NOT NULL DEFAULT 'manual',strategy TEXT NOT NULL DEFAULT 'copy',
+        adapter_id TEXT,enabled INTEGER NOT NULL DEFAULT 1,validation_status TEXT NOT NULL DEFAULT 'unvalidated',
+        validation_message TEXT NOT NULL DEFAULT '',last_scanned_at TEXT,created_at TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL DEFAULT '');
+      CREATE TABLE mods(id TEXT PRIMARY KEY,name TEXT NOT NULL,version TEXT,author TEXT,description TEXT,
+        archive TEXT NOT NULL,archive_hash TEXT NOT NULL UNIQUE,imported_at TEXT NOT NULL,extracted_path TEXT NOT NULL,notes TEXT DEFAULT '');
+      CREATE TABLE mod_files(mod_id TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,relative_path TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(mod_id,relative_path));
+      CREATE TABLE profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
+      CREATE TABLE profile_mods(profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE,mod_id TEXT REFERENCES mods(id) ON DELETE CASCADE,PRIMARY KEY(profile_id,mod_id));
+      CREATE TABLE deployments(id TEXT PRIMARY KEY,profile_id TEXT,started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,journal TEXT NOT NULL,message TEXT DEFAULT '');
+      CREATE TABLE deployment_files(deployment_id TEXT REFERENCES deployments(id),relative_path TEXT NOT NULL,existed INTEGER NOT NULL,original_hash TEXT,backup_path TEXT,deployed_hash TEXT,status TEXT NOT NULL,PRIMARY KEY(deployment_id,relative_path));
+      CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      INSERT INTO games(id,name,root,created_at) VALUES('g1','One','/tmp/g1','2025-01-01');
+      INSERT INTO games(id,name,root,created_at) VALUES('g2','Two','/tmp/g2','2025-01-02');
+      INSERT INTO profiles VALUES('default','Default','2025-01-01');
+      INSERT INTO profiles VALUES('custom','Custom','2025-01-02');
+      INSERT INTO mods(id,name,archive,archive_hash,imported_at,extracted_path) VALUES('m1','One mod','/a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2025-01-01','/mods/m1');
+      INSERT INTO profile_mods VALUES('custom','m1');
+      INSERT INTO settings VALUES('active_profile','custom');
+      PRAGMA user_version=2;
+    """)
+    connection.commit();connection.close()
+    migrated=Database(path)
+    with migrated.connect() as db:
+        g1=db.execute("SELECT id FROM profiles WHERE game_id='g1' AND name='Custom [g1]'").fetchone()
+        g2=db.execute("SELECT id FROM profiles WHERE game_id='g2' AND name='Custom [g2]'").fetchone()
+        assert g1 and g2 and g1[0]!=g2[0]
+        assert db.execute("SELECT value FROM settings WHERE key='active_profile:g1'").fetchone()[0]==g1[0]
+        assert db.execute("SELECT value FROM settings WHERE key='active_profile:g2'").fetchone()[0]==g2[0]
+        assert db.execute("SELECT COUNT(*) FROM profile_mods WHERE profile_id IN (?,?)",(g1[0],g2[0])).fetchone()[0]==2
+        assert db.execute("SELECT COUNT(*) FROM profiles WHERE game_id IS NULL").fetchone()[0]==2
 
 
 def test_steam_multiple_library_folders_and_missing_mount(tmp_path):
@@ -150,6 +187,56 @@ def test_each_registered_game_gets_isolated_default_profile(tmp_path):
     assert next(p for p in profiles.list_profiles(second) if p["id"]==same_name_other_game)["name"]=="Testing"
     with pytest.raises(ValueError, match="same game"):
         profiles.create("Wrong game", first_profiles[0]["id"], game_id=second)
+
+
+def test_profile_definition_export_import_resolves_mods_by_archive_hash(tmp_path):
+    import zipfile
+    from modforge.core.archive_importer import ArchiveImporter
+    from modforge.core.mod_library import ModLibrary
+    archive=tmp_path/"portable-profile.zip"
+    with zipfile.ZipFile(archive,"w") as stream:stream.writestr("some/file.dat",b"profile content")
+    library_one=ModLibrary(Database(tmp_path/"one.db"),ArchiveImporter(tmp_path/"one-archives",tmp_path/"one-mods"))
+    mod_id=library_one.import_archive(archive)
+    game_one=GameRegistry(library_one.db).register("Portable one",tmp_path/"game-one")
+    profile_one=ProfileManager(library_one.db).list_profiles(game_one)[0]["id"]
+    ProfileManager(library_one.db).set_enabled(profile_one,mod_id,True)
+    definition=ProfileManager(library_one.db).export_definition(profile_one)
+
+    library_two=ModLibrary(Database(tmp_path/"two.db"),ArchiveImporter(tmp_path/"two-archives",tmp_path/"two-mods"))
+    second_mod=library_two.import_archive(archive)
+    game_two=GameRegistry(library_two.db).register("Portable two",tmp_path/"game-two")
+    profile_two=ProfileManager(library_two.db).import_definition(definition,game_two,name="Imported")
+    assert library_two.enabled_mod_ids(profile_two)==[second_mod]
+    assert next(p for p in ProfileManager(library_two.db).list_profiles(game_two) if p["id"]==profile_two)["name"]=="Imported"
+    empty=ProfileManager(library_two.db).create("Empty",game_id=game_two)
+    assert ProfileManager(library_two.db).compare(empty,profile_two)["added"]==["portable-profile"]
+    invalid={"schema":1,"profile":{"name":"bad"},"mods":[{"id":"x","archive_hash":"not-a-hash","path":"../../outside"}]}
+    with pytest.raises(ValueError,match="invalid mod reference"):
+        ProfileManager(library_two.db).import_definition(invalid,game_two)
+
+
+def test_profile_comparison_requires_same_game(services,tmp_path):
+    db,*_=services;registry=GameRegistry(db);profiles=ProfileManager(db)
+    first=registry.register("Compare One",tmp_path/"compare-one")
+    second=registry.register("Compare Two",tmp_path/"compare-two")
+    p1=profiles.list_profiles(first)[0]["id"];p2=profiles.list_profiles(second)[0]["id"]
+    with pytest.raises(ValueError,match="different games"):
+        profiles.compare(p1,p2)
+
+
+def test_mod_metadata_edit_is_persistent_and_bounded(services,tmp_path):
+    import zipfile
+    _,library,*_=services
+    archive=tmp_path/"metadata.zip"
+    with zipfile.ZipFile(archive,"w") as stream:stream.writestr("file.dat",b"x")
+    mod_id=library.import_archive(archive)
+    library.update_metadata(mod_id,name="Better name",author="Mod author",source_url="https://example.invalid/mod",
+                            category="Graphics",tags="visual, texture",notes="local note")
+    mod=next(row for row in library.list_mods() if row["id"]==mod_id)
+    assert (mod["name"],mod["author"],mod["category"],mod["tags"],mod["notes"])==(
+        "Better name","Mod author","Graphics","visual, texture","local note")
+    with pytest.raises(ValueError,match="text length"):
+        library.update_metadata(mod_id,name="Invalid",description="d"*20_001)
 
 
 def test_game_specific_mappings_persist_and_reject_collisions(services, tmp_path):
@@ -246,14 +333,19 @@ def test_apply_profile_disables_only_owned_files(services, tmp_path):
     library.set_mappings(game_id,mod_id,{"mod/file.dat":"game/file.dat"},GenericFileAdapter())
     unowned=root/"notes.txt"; unowned.write_text("keep")
     manifest=library.mapped_manifest(profile,game_id)
-    deployment=manager.apply_profile(root,GenericFileAdapter(),profile,manifest,game_id)
+    deployment=manager.apply_profile(root,GenericFileAdapter(),profile,manifest,game_id,
+                                     owners={"game/file.dat":[mod_id]})
     assert deployment and (root/"game/file.dat").read_bytes()==b"managed"
+    with db.connect() as connection:
+        owner=connection.execute("SELECT mod_ids,fingerprint,status FROM deployed_file_owners WHERE game_id=? AND relative_path='game/file.dat'",(game_id,)).fetchone()
+        assert owner["mod_ids"]==f'["{mod_id}"]' and owner["status"]=="active"
     ProfileManager(db).set_enabled(profile,mod_id,False)
     assert manager.apply_profile(root,GenericFileAdapter(),profile,{},game_id) is None
     assert not (root/"game/file.dat").exists()
     assert unowned.read_text()=="keep"
     with db.connect() as connection:
         assert connection.execute("SELECT status FROM deployments WHERE id=?",(deployment,)).fetchone()[0]=="rolled_back"
+        assert connection.execute("SELECT status FROM deployed_file_owners WHERE game_id=? AND relative_path='game/file.dat'",(game_id,)).fetchone()[0]=="rolled_back"
 
 
 def test_profile_transition_preserves_previous_profile_after_new_apply_failure(services, tmp_path, monkeypatch):

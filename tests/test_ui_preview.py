@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QTableWidget
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem
 
 from modforge.config import AppPaths
 from modforge.core.archive_importer import ArchiveImporter
@@ -108,3 +108,13 @@ def test_profile_preview_lists_modforge_owned_removals(window,tmp_path,monkeypat
     assert captured["action"]=="Remove ModForge-created file if unchanged"
     assert captured["enabled"]
     assert (root/"mod/file.dat").exists()
+
+
+def test_backup_restore_action_targets_the_selected_transaction(window,monkeypatch):
+    window.backup_table.setRowCount(1)
+    window.backup_table.setItem(0,0,QTableWidgetItem("transaction-id"))
+    window.backup_table.selectRow(0)
+    captured={}
+    monkeypatch.setattr(window,"_rollback_deployment",lambda deployment_id:captured.setdefault("id",deployment_id))
+    window.rollback_backup_selected()
+    assert captured["id"]=="transaction-id"
