@@ -15,7 +15,8 @@ from modforge.core.profile_manager import ProfileManager
 from modforge.core.rollback_manager import RollbackManager
 from modforge.core.recovery_manager import RecoveryManager
 from modforge.database import Database
-from modforge.games.cyberpunk2077 import Cyberpunk2077Adapter
+from modforge.games.discovery import discover_steam_games
+from modforge.games.registry import GameRegistry
 from modforge.ui.workers import FunctionWorker
 
 log = logging.getLogger(__name__)
@@ -26,9 +27,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.paths, self.db, self.library, self.deployments = paths, db, library, deployments
         self.profiles = ProfileManager(db)
+        self.games = GameRegistry(db)
         self.rollback_manager = RollbackManager(db, paths.data / "locks")
         self.recovery_manager = RecoveryManager(db, paths.data / "backups", paths.data / "journals", paths.data / "locks")
-        self.adapter = Cyberpunk2077Adapter()
         self.thread_pool = QThreadPool.globalInstance()
         self.busy = False
         self.setWindowTitle("ModForge")
@@ -70,7 +71,15 @@ class MainWindow(QMainWindow):
             actions.addStretch(); layout.addLayout(actions)
             self.activity = QLabel("No deployment activity yet."); self.activity.setObjectName("muted"); layout.addWidget(self.activity); layout.addStretch()
         elif name == "Games":
-            layout.addWidget(QLabel("Cyberpunk 2077 is the first supported game.")); self.game_status = QLabel(); self.game_status.setObjectName("muted"); layout.addWidget(self.game_status); layout.addStretch()
+            actions=QHBoxLayout()
+            add_game=QPushButton("＋  Add Game"); add_game.setObjectName("primary"); add_game.clicked.connect(self.add_game); actions.addWidget(add_game)
+            discover=QPushButton("Discover Steam games"); discover.clicked.connect(self.discover_games); actions.addWidget(discover)
+            set_active=QPushButton("Use selected"); set_active.clicked.connect(self.set_active_game); actions.addWidget(set_active)
+            edit=QPushButton("Edit selected"); edit.clicked.connect(self.edit_game); actions.addWidget(edit)
+            rescan=QPushButton("Rescan"); rescan.clicked.connect(self.rescan_games); actions.addWidget(rescan)
+            remove=QPushButton("Remove registration"); remove.clicked.connect(self.remove_game); actions.addWidget(remove); actions.addStretch(); layout.addLayout(actions)
+            self.games_table=QTableWidget(0,5); self.games_table.setHorizontalHeaderLabels(["Game", "Installation", "Status", "Strategy", "Source"]); self.games_table.horizontalHeader().setStretchLastSection(True); self.games_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); layout.addWidget(self.games_table,1)
+            self.game_status = QLabel("Generic file-based management is available without a dedicated adapter. Game and mod compatibility remains game-specific."); self.game_status.setObjectName("muted"); self.game_status.setWordWrap(True); layout.addWidget(self.game_status)
         elif name == "Mod Library":
             self.mod_table = QTableWidget(0,5); self.mod_table.setHorizontalHeaderLabels(["Mod", "Version", "Imported", "Archive", "Files"]); self.mod_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.mod_table,1)
             self.mod_empty = QLabel("Your library is empty. Import a ZIP archive to get started."); self.mod_empty.setObjectName("muted"); self.mod_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.mod_empty)
@@ -97,18 +106,16 @@ class MainWindow(QMainWindow):
             self.backup_empty = QLabel("No deployment snapshots yet."); self.backup_empty.setObjectName("muted"); self.backup_empty.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.backup_empty)
             retained = QLabel("Snapshots remain available after rollback."); retained.setObjectName("muted"); layout.addWidget(retained)
         else:
-            layout.addWidget(QLabel("Cyberpunk 2077 game root")); row=QHBoxLayout(); self.game_path=QLineEdit(self.db.setting("game_root")); self.game_path.setPlaceholderText("Select the directory containing bin/x64"); row.addWidget(self.game_path)
-            browse=QPushButton("Browse…"); browse.clicked.connect(self.browse_game); row.addWidget(browse); save=QPushButton("Save path"); save.clicked.connect(self.save_game); row.addWidget(save); layout.addLayout(row)
-            self.settings_status=QLabel(); self.settings_status.setObjectName("muted"); layout.addWidget(self.settings_status)
+            layout.addWidget(QLabel("Game installations are managed from the Games page. Select a registered game as active before previewing deployment."));
             layout.addWidget(QLabel(f"Application data: {self.paths.data}\nConfiguration: {self.paths.config}\nLogs: {self.paths.state}")); open_logs=QPushButton("Open logs folder"); open_logs.clicked.connect(lambda: self.open_folder(self.paths.state)); layout.addWidget(open_logs,alignment=Qt.AlignmentFlag.AlignLeft); layout.addStretch()
         return page
 
     def show_page(self, name: str) -> None:
         idx = list(self.pages).index(name); self.stack.setCurrentIndex(idx)
         for i, button in enumerate(self.nav_buttons): button.setChecked(i == idx)
-        if name == "Settings": self.validate_game_path()
 
     def refresh(self) -> None:
+        self.refresh_games()
         if hasattr(self, "mod_table"): self.refresh_mod_table()
         if hasattr(self, "profile_combo"): self.refresh_profiles()
         if hasattr(self, "deployment_table"): self.refresh_deployments()
@@ -119,11 +126,105 @@ class MainWindow(QMainWindow):
             active = self.db.setting("active_profile", "default")
             profile = next((p["name"] for p in self.profiles.list_profiles() if p["id"] == active), "Default")
             library_status = "Import a ZIP in Mod Library to begin." if not mods else f"Imported mods: {len(mods)}"
-            self.dashboard_info.setText(f"<b>Cyberpunk 2077</b>　 ·　Profile: {profile}　 ·　{library_status}\nGame root: {self.db.setting('game_root', 'Not configured')}\nSelect a deployment after reviewing the destination preview.")
+            game=self._active_game()
+            game_label=game["name"] if game else "No game selected"
+            game_root=game["root"] if game else "Register a game on the Games page"
+            self.dashboard_info.setText(f"<b>{game_label}</b>　 ·　Profile: {profile}　 ·　{library_status}\nGame root: {game_root}\nSelect a deployment after reviewing the destination preview.")
             unresolved_count = len(self.recovery_manager.unresolved())
             if unresolved_count:
                 self.dashboard_info.setText(self.dashboard_info.text() + f"\n<span style='color:#ffbd69'>Recovery needs attention: {unresolved_count} operation(s)</span>")
         self.refresh_game_status()
+
+    def _active_game(self):
+        game_id=self.db.setting("active_game", "")
+        game=self.games.get(game_id) if game_id else None
+        if game is None:
+            all_games=self.games.list_games()
+            game=all_games[0] if all_games else None
+            if game:
+                self.db.set_setting("active_game",game["id"])
+        return game
+
+    def _game_context(self):
+        game=self._active_game()
+        if not game:
+            return None, None
+        return Path(game["root"]), self.games.adapter_for(game["id"])
+
+    def refresh_games(self):
+        if not hasattr(self,"games_table"): return
+        games=self.games.list_games(); active=self.db.setting("active_game", "")
+        self.games_table.setRowCount(len(games))
+        for i,game in enumerate(games):
+            status=game["validation_message"] or game["validation_status"]
+            values=[game["name"]+ ("  ·  Active" if game["id"]==active else ""), game["root"], status, game["strategy"], game["source"]]
+            for j,value in enumerate(values):
+                item=QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole,game["id"]); self.games_table.setItem(i,j,item)
+
+    def _selected_game_id(self):
+        row=self.games_table.currentRow() if hasattr(self,"games_table") else -1
+        if row < 0: return ""
+        return self.games_table.item(row,0).data(Qt.ItemDataRole.UserRole)
+
+    def add_game(self):
+        name,ok=QInputDialog.getText(self,"Add Game","Display name")
+        if not ok:return
+        path=QFileDialog.getExistingDirectory(self,"Select installation directory",str(Path.home()))
+        if not path:return
+        executable,exec_ok=QInputDialog.getText(self,"Optional executable","Executable path relative to installation directory (leave blank if launcher-managed)")
+        if not exec_ok:return
+        try:
+            game_id=self.games.register(name,path,executable=executable.strip() or None)
+            self.db.set_setting("active_game",game_id)
+            self.refresh()
+        except Exception as exc:QMessageBox.warning(self,"Game not registered",str(exc))
+
+    def discover_games(self):
+        try: candidates=discover_steam_games()
+        except Exception as exc:
+            QMessageBox.warning(self,"Steam discovery failed",str(exc)); return
+        if not candidates:
+            QMessageBox.information(self,"No Steam installations found","No installed game manifests were found in the standard Steam libraries."); return
+        choices=[f"{g['name']} — {g['root']}" for g in candidates]
+        choice,ok=QInputDialog.getItem(self,"Discovered Steam games","Choose an installation to register",choices,0,False)
+        if not ok:return
+        game=candidates[choices.index(choice)]
+        try:
+            game_id=self.games.register(game["name"],game["root"],source="steam",platform=game["platform"])
+            self.db.set_setting("active_game",game_id); self.refresh()
+        except Exception as exc:QMessageBox.warning(self,"Game not registered",str(exc))
+
+    def set_active_game(self):
+        game_id=self._selected_game_id()
+        if game_id:self.db.set_setting("active_game",game_id); self.refresh()
+
+    def rescan_games(self):
+        for game in self.games.list_games(): self.games.validate(game["id"])
+        self.refresh()
+
+    def remove_game(self):
+        game_id=self._selected_game_id()
+        if not game_id:return
+        answer=QMessageBox.question(self,"Remove game registration","Remove this entry from ModForge? The game files will not be changed.",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
+        if answer!=QMessageBox.StandardButton.Yes:return
+        self.games.remove(game_id)
+        if self.db.setting("active_game")==game_id:self.db.set_setting("active_game","")
+        self.refresh()
+
+    def edit_game(self):
+        game_id=self._selected_game_id()
+        game=self.games.get(game_id) if game_id else None
+        if not game:return
+        name,ok=QInputDialog.getText(self,"Edit Game","Display name",text=game["name"])
+        if not ok:return
+        root,ok=QInputDialog.getText(self,"Edit Game","Installation directory",text=game["root"])
+        if not ok:return
+        executable,ok=QInputDialog.getText(self,"Edit Game","Optional executable path",text=game["executable"] or "")
+        if not ok:return
+        try:
+            self.games.edit(game_id,name=name,root=root,executable=executable.strip() or None)
+            self.refresh()
+        except Exception as exc:QMessageBox.warning(self,"Game not updated",str(exc))
 
     def refresh_mod_table(self) -> None:
         if not hasattr(self,"mod_table"): return
@@ -202,10 +303,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:QMessageBox.warning(self,"Profile not deleted",str(exc))
 
     def deploy_profile(self) -> None:
-        root=Path(self.db.setting("game_root",""))
-        valid,reason=self.adapter.validate_root(root)
+        root,adapter=self._game_context()
+        if root is None:
+            QMessageBox.warning(self,"No game selected","Register a game on the Games page before deploying."); return
+        valid,reason=adapter.validate_root(root)
         if not valid:
-            QMessageBox.warning(self,"Game directory not ready",reason+". Choose a valid Cyberpunk 2077 root in Settings before deploying.")
+            QMessageBox.warning(self,"Game directory not ready",reason+". Edit the installation on the Games page.")
             return
         profile=self.db.setting("active_profile","default")
         with self.db.connect() as db:
@@ -224,7 +327,7 @@ class MainWindow(QMainWindow):
         if not targets:QMessageBox.information(self,"Nothing to deploy","Enable at least one mod in the active profile."); return
         if not self._show_deployment_preview(root,profile,rows,targets):return
         self._run_background("Deploying files; cancellation is unavailable during recovery-safe transaction…",
-            lambda: self.deployments.deploy(root,self.adapter,profile,targets),
+            lambda: self.deployments.deploy(root,adapter,profile,targets),
             lambda uid: QMessageBox.information(self,"Deployment complete",f"Deployment {uid} completed and verified."))
 
     def _show_deployment_preview(self, root: Path, profile: str, rows, targets: dict[str,Path]) -> bool:
@@ -344,12 +447,14 @@ class MainWindow(QMainWindow):
         row=self.recovery_table.currentRow()
         if row<0:return
         deployment_id=self.recovery_table.item(row,0).text()
-        root=Path(self.db.setting("game_root",""))
+        root,adapter=self._game_context()
+        if root is None:
+            QMessageBox.warning(self,"No game selected","Select a registered game before recovery."); return
         self._run_background("Inspecting deployment journal and backups…",
-            lambda:self.recovery_manager.inspect(deployment_id,root,self.adapter),
-            lambda report:self._confirm_recovery(deployment_id,root,report))
+            lambda:self.recovery_manager.inspect(deployment_id,root,adapter),
+            lambda report:self._confirm_recovery(deployment_id,root,adapter,report))
 
-    def _confirm_recovery(self, deployment_id: str, root: Path, report: dict) -> None:
+    def _confirm_recovery(self, deployment_id: str, root: Path, adapter, report: dict) -> None:
         lines=[f"Deployment: {report['id']}",f"Recorded state: {report['status']}","", "File assessment:"]
         lines.extend(f"• {f['path']} — {f['condition']}; backup: {f['backup_status']}" for f in report["files"])
         if report["status"] in {"committed", "rolled_back"}:
@@ -361,46 +466,39 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
         if result!=QMessageBox.StandardButton.Yes:return
         self._run_background("Recovering deployment; journal progress is being saved…",
-            lambda:self.recovery_manager.recover(deployment_id,root,self.adapter,confirmed=True),
+            lambda:self.recovery_manager.recover(deployment_id,root,adapter,confirmed=True),
             lambda outcome:QMessageBox.information(self,"Recovery complete",
                 f"Deployment {outcome['id']} is now recorded as {outcome['status']}."))
     def rollback_selected(self) -> None:
         row=self.deployment_table.currentRow()
         if row<0:return
-        uid=self.deployment_table.item(row,0).text(); root=Path(self.db.setting("game_root",""))
+        uid=self.deployment_table.item(row,0).text(); root,adapter=self._game_context()
+        if root is None:
+            QMessageBox.warning(self,"No game selected","Select a registered game before rollback."); return
         answer=QMessageBox.question(self,"Confirm rollback",f"Restore files from deployment {uid}? Backups will be retained.",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
         if answer!=QMessageBox.StandardButton.Yes:return
         self._run_background("Rolling back deployment; progress is being journaled…",
-            lambda:self.rollback_manager.rollback(uid,root,self.adapter),
+            lambda:self.rollback_manager.rollback(uid,root,adapter),
             lambda _result:QMessageBox.information(self,"Rollback complete","Files were restored and backups were retained."),
-            lambda error:self._rollback_failed(uid,root,error))
+            lambda error:self._rollback_failed(uid,root,adapter,error))
 
-    def _rollback_failed(self, uid: str, root: Path, error: str) -> None:
+    def _rollback_failed(self, uid: str, root: Path, adapter, error: str) -> None:
         if "ambiguous files and needs confirmation" in error or "Files changed outside ModForge" in error:
             confirm=QMessageBox.question(self,"Files changed outside ModForge",
                 f"{error}\n\nRestore verified original backups over these changes? Unknown files created by another process will be preserved.",
                 QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
             if confirm==QMessageBox.StandardButton.Yes:
                 self._run_background("Restoring confirmed backup files…",
-                    lambda:self.rollback_manager.rollback(uid,root,self.adapter,confirm_external_changes=True),
+                    lambda:self.rollback_manager.rollback(uid,root,adapter,confirm_external_changes=True),
                     lambda _result:QMessageBox.information(self,"Rollback complete","Original files were restored. Backups remain available."))
         else:
             QMessageBox.critical(self,"Rollback stopped",error)
         self.refresh()
 
-    def browse_game(self) -> None:
-        path=QFileDialog.getExistingDirectory(self,"Select Cyberpunk 2077 game root",self.game_path.text() or str(Path.home()))
-        if path:self.game_path.setText(path); self.validate_game_path()
-    def save_game(self) -> None:
-        self.db.set_setting("game_root",self.game_path.text().strip()); self.validate_game_path(); self.refresh()
-    def validate_game_path(self) -> None:
-        if hasattr(self,"game_path"):
-            ok,msg=self.adapter.validate_root(Path(self.game_path.text())) if self.game_path.text() else (False,"Choose the game root directory")
-            self.settings_status.setText(("✓ " if ok else "! ")+msg)
     def refresh_game_status(self) -> None:
         if hasattr(self,"game_status"):
-            ok,msg=self.adapter.validate_root(Path(self.db.setting("game_root",""))) if self.db.setting("game_root") else (False,"No game root configured")
-            self.game_status.setText(("✓ " if ok else "! ")+msg)
+            games=self.games.list_games()
+            self.game_status.setText(f"{len(games)} registered game installation(s). Generic file deployment does not verify game-specific mod compatibility.")
     @staticmethod
     def open_folder(path:Path) -> None:
         # Use Qt's desktop integration so this remains compatible with Wayland environments.

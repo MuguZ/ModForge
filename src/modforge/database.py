@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -55,6 +55,33 @@ class Database:
                     PRAGMA user_version=1;
                 """)
                 db.execute("INSERT INTO profiles(id,name,created_at) VALUES('default','Default',datetime('now'))")
+                version = 1
+            if version < 2:
+                # Extend the original game table in place so existing deployments and
+                # user registrations retain their IDs and relationships.
+                columns = {row[1] for row in db.execute("PRAGMA table_info(games)")}
+                additions = {
+                    "executable": "TEXT", "launcher": "TEXT", "platform": "TEXT NOT NULL DEFAULT 'linux'",
+                    "source": "TEXT NOT NULL DEFAULT 'manual'", "strategy": "TEXT NOT NULL DEFAULT 'copy'",
+                    "adapter_id": "TEXT", "enabled": "INTEGER NOT NULL DEFAULT 1",
+                    "validation_status": "TEXT NOT NULL DEFAULT 'unvalidated'",
+                    "validation_message": "TEXT NOT NULL DEFAULT ''", "last_scanned_at": "TEXT",
+                    "created_at": "TEXT NOT NULL DEFAULT ''", "updated_at": "TEXT NOT NULL DEFAULT ''",
+                }
+                for column, declaration in additions.items():
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE games ADD COLUMN {column} {declaration}")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_games_root ON games(root)")
+                db.execute("UPDATE games SET created_at=datetime('now') WHERE created_at=''")
+                db.execute("UPDATE games SET updated_at=datetime('now') WHERE updated_at=''")
+                legacy_root = db.execute("SELECT value FROM settings WHERE key='game_root'").fetchone()
+                if legacy_root and legacy_root[0] and not db.execute("SELECT 1 FROM games LIMIT 1").fetchone():
+                    db.execute("""INSERT INTO games(id,name,root,platform,source,strategy,adapter_id,
+                               validation_status,created_at,updated_at)
+                               VALUES('legacy-cyberpunk2077','Cyberpunk 2077',?,'linux','legacy','copy',
+                                      'cyberpunk2077','unvalidated',datetime('now'),datetime('now'))""",
+                               (legacy_root[0],))
+                db.execute("PRAGMA user_version=2")
 
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as db:

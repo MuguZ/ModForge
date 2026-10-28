@@ -1,5 +1,6 @@
 """Application paths and safe defaults."""
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -12,10 +13,13 @@ class AppPaths:
     @classmethod
     def default(cls) -> "AppPaths":
         home = Path.home()
+        data_home = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")).expanduser()
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")).expanduser()
+        state_home = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")).expanduser()
         return cls(
-            Path.home() / ".local/share/modforge",
-            home / ".config/modforge",
-            home / ".local/state/modforge",
+            data_home / "modforge",
+            config_home / "modforge",
+            state_home / "modforge",
         )
 
     def initialize(self) -> None:
