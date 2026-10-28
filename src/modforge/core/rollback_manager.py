@@ -25,7 +25,9 @@ class RollbackManager:
             later = db.execute("""SELECT COUNT(*) FROM deployment_files older
                 JOIN deployment_files newer ON lower(newer.relative_path)=lower(older.relative_path)
                 JOIN deployments d ON d.id=newer.deployment_id
+                JOIN deployments old_deployment ON old_deployment.id=older.deployment_id
                 WHERE older.deployment_id=? AND d.started_at>(SELECT started_at FROM deployments WHERE id=?)
+                AND (old_deployment.game_id IS NULL OR d.game_id IS NULL OR old_deployment.game_id=d.game_id)
                 AND d.status NOT IN ('rolled_back','failed_recovered')""", (deployment_id, deployment_id)).fetchone()[0]
         if later:
             raise DeploymentError("A later deployment overlaps these files; roll back newer deployments first")

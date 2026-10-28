@@ -1,6 +1,6 @@
 # Game adapters
 
-Adapters provide optional game-specific checks around the generic file deployment engine. The generic adapter accepts an accessible installation directory and deliberately makes no claim about mod compatibility.
+Adapters provide optional game-specific checks around the generic file deployment engine. The generic adapter accepts an accessible installation directory and deliberately makes no claim about mod compatibility. Profile membership and file mappings are stored by registered game ID, while the imported mod and its source files remain in the shared library.
 
 ## Contract
 
@@ -12,7 +12,9 @@ Implement `GameAdapter` from `modforge.games.base`:
 - `validate_relative_path(value)`: retain safe relative-path validation; stricter adapters may add rules
 - `supported_locations()`: informational locations only; generic deployment does not require them
 
-An adapter must not bypass `DeploymentManager` path containment, no-follow checks, backup, journaling, or verification. The current registry selects the built-in Cyberpunk adapter only for migrated Cyberpunk records and otherwise uses `GenericFileAdapter`. Third-party entry-point discovery and an adapter compatibility/version protocol are future work; do not install an adapter from an archive or treat untrusted plugin code as safe.
+An adapter must not bypass `DeploymentManager` path containment, no-follow checks, backup, journaling, or verification. Persisted destination mappings are revalidated by the adapter during deployment. `DeploymentManager.apply_profile` restores the previous successful deployment for that installation before applying the selected profile; it refuses ambiguous external modifications and retains recovery material. This transition consists of multiple durable file transactions, not one filesystem-atomic operation.
+
+The current registry selects the built-in Cyberpunk adapter for Cyberpunk registrations and otherwise uses `GenericFileAdapter`. Third-party entry-point discovery and an adapter compatibility/version protocol are future work; do not install an adapter from an archive or treat untrusted plugin code as safe.
 
 ## Adding an adapter
 

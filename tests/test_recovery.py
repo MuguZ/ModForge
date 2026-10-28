@@ -211,7 +211,7 @@ def test_database_v1_reopen_preserves_existing_schema(services):
     from modforge.database import Database
     reopened = Database(db.path)
     with reopened.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM deployments").fetchone()[0] == 0
 
 
@@ -407,7 +407,7 @@ def test_legacy_schema_less_journal_loads(services, tmp_path):
 def test_previous_database_schema_opens_without_loss(services):
     db, *_ = services
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute("SELECT name FROM profiles WHERE id='default'").fetchone()[0] == "Default"
     reopened = type(db)(db.path)
     with reopened.connect() as conn:

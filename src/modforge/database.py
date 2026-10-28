@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -82,6 +82,51 @@ class Database:
                                       'cyberpunk2077','unvalidated',datetime('now'),datetime('now'))""",
                                (legacy_root[0],))
                 db.execute("PRAGMA user_version=2")
+                version = 2
+            if version < 3:
+                # Add nullable associations first; legacy rows stay valid and are
+                # attached only when a matching legacy installation is known.
+                profile_columns = {row[1] for row in db.execute("PRAGMA table_info(profiles)")}
+                if "game_id" not in profile_columns:
+                    db.execute("ALTER TABLE profiles ADD COLUMN game_id TEXT REFERENCES games(id) ON DELETE SET NULL")
+                if "is_default" not in profile_columns:
+                    db.execute("ALTER TABLE profiles ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0")
+                deployment_columns = {row[1] for row in db.execute("PRAGMA table_info(deployments)")}
+                if "game_id" not in deployment_columns:
+                    db.execute("ALTER TABLE deployments ADD COLUMN game_id TEXT REFERENCES games(id) ON DELETE SET NULL")
+                legacy_game = db.execute("SELECT id FROM games WHERE id='legacy-cyberpunk2077'").fetchone()
+                game_rows = db.execute("SELECT id FROM games WHERE enabled=1 ORDER BY created_at,id").fetchall()
+                if legacy_game or len(game_rows) == 1:
+                    game_id = legacy_game[0] if legacy_game else game_rows[0][0]
+                    db.execute("UPDATE profiles SET game_id=?,is_default=CASE WHEN id='default' THEN 1 ELSE is_default END WHERE game_id IS NULL",
+                               (game_id,))
+                    db.execute("UPDATE deployments SET game_id=? WHERE game_id IS NULL", (game_id,))
+                elif len(game_rows) > 1:
+                    old_active = db.execute("SELECT value FROM settings WHERE key='active_profile'").fetchone()
+                    old_profiles = db.execute("SELECT id,name,created_at FROM profiles WHERE game_id IS NULL").fetchall()
+                    for game_row in game_rows:
+                        game_id = game_row[0]
+                        for profile in old_profiles:
+                            new_id = f"migrated-{game_id}-{profile['id']}"
+                            new_name = f"{profile['name']} [{game_id}]"
+                            is_default = int(profile["id"] == "default")
+                            db.execute("INSERT OR IGNORE INTO profiles(id,name,created_at,game_id,is_default) VALUES(?,?,?,?,?)",
+                                       (new_id,new_name,profile["created_at"],game_id,is_default))
+                            db.execute("INSERT OR IGNORE INTO profile_mods(profile_id,mod_id) SELECT ?,mod_id FROM profile_mods WHERE profile_id=?",
+                                       (new_id,profile["id"]))
+                            if old_active and old_active[0] == profile["id"]:
+                                db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                           (f"active_profile:{game_id}",new_id))
+                db.execute("CREATE INDEX IF NOT EXISTS idx_profiles_game ON profiles(game_id,is_default)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_deployments_game ON deployments(game_id,started_at)")
+                db.execute("""CREATE TABLE IF NOT EXISTS mod_mappings(
+                    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                    mod_id TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+                    source_path TEXT NOT NULL,
+                    destination_path TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(game_id,mod_id,source_path))""")
+                db.execute("PRAGMA user_version=3")
 
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as db:

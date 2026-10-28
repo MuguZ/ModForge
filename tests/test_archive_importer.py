@@ -49,3 +49,21 @@ def test_duplicate_archive_detected(tmp_path,services):
     archive=tmp_path/"mod.zip";make_zip(archive,[("x",b"x")])
     library.import_archive(archive)
     with pytest.raises(ArchiveError):library.import_archive(archive)
+
+
+def test_preview_validates_without_extracting_and_limits_nesting(tmp_path):
+    archive=tmp_path/"nested.zip"; make_zip(archive,[("One/Two/file.dat",b"ok")])
+    importer=ArchiveImporter(tmp_path/"archives",tmp_path/"mods")
+    preview=importer.inspect_zip(archive)
+    assert preview.files==(("One/Two/file.dat",2),)
+    assert list((tmp_path/"mods").iterdir())==[]
+    deep=tmp_path/"deep.zip"; make_zip(deep,[("a/b/c/d/e",b"x")])
+    limited=ArchiveImporter(tmp_path/"a2",tmp_path/"m2",ArchiveLimits(nesting_depth=3))
+    with pytest.raises(ArchiveError,match="nested too deeply"):
+        limited.inspect_zip(deep)
+
+
+def test_preview_rejects_file_directory_path_conflict(tmp_path):
+    archive=tmp_path/"conflict.zip"; make_zip(archive,[("a",b"file"),("a/b",b"child")])
+    with pytest.raises(ArchiveError,match="used as a directory"):
+        ArchiveImporter(tmp_path/"a",tmp_path/"m").inspect_zip(archive)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -79,11 +80,19 @@ class DeploymentManager:
         self.lock_dir = lock_dir.resolve()
 
     def deploy(self, root: Path, adapter: GameAdapter, profile_id: str,
-               manifest: dict[str, Path]) -> str:
+               manifest: dict[str, Path], game_id: str | None = None) -> str:
         ok, reason = adapter.validate_root(root)
         if not ok:
             raise DeploymentError(reason)
         root = root.resolve(strict=True)
+        if game_id:
+            with self.db.connect() as db:
+                game = db.execute("SELECT root,enabled FROM games WHERE id=?", (game_id,)).fetchone()
+                profile = db.execute("SELECT game_id FROM profiles WHERE id=?", (profile_id,)).fetchone()
+                if not game or not game["enabled"] or Path(game["root"]).resolve(strict=False) != root:
+                    raise DeploymentError("Selected game registration does not match the deployment root")
+                if not profile or profile["game_id"] not in (game_id, None):
+                    raise DeploymentError("Profile is not associated with the selected game")
         paths: dict[str, Path] = {}
         folded: set[str] = set()
         for raw, source in manifest.items():
@@ -103,19 +112,113 @@ class DeploymentManager:
             paths[rel] = source
         lock_path = self._lock_path(root)
         with locked_file(lock_path):
-            return self._deploy_locked(root, adapter, profile_id, paths)
+            return self._deploy_locked(root, adapter, profile_id, paths, game_id)
+
+    def apply_profile(self, root: Path, adapter: GameAdapter, profile_id: str,
+                      manifest: dict[str, Path], game_id: str) -> str | None:
+        """Safely replace this game's active ModForge deployment with a profile.
+
+        Existing successful transactions for the same registered game are rolled
+        back in reverse order, then the requested manifest is deployed. If the new
+        deployment fails, the previous effective manifest is re-applied.
+        """
+        ok, reason = adapter.validate_root(root)
+        if not ok:
+            raise DeploymentError(reason)
+        root = root.resolve(strict=True)
+        paths = {}
+        folded = set()
+        for raw, source in manifest.items():
+            try:
+                relative = adapter.validate_relative_path(raw)
+            except ValueError as exc:
+                raise DeploymentError(str(exc)) from exc
+            if relative.casefold() in folded:
+                raise DeploymentError(f"Destination collision: {relative}")
+            folded.add(relative.casefold())
+            source = Path(source)
+            if source.is_symlink() or not source.is_file():
+                raise DeploymentError(f"Invalid or symbolic-link source file: {source}")
+            paths[relative] = source
+        with self.db.connect() as db:
+            game = db.execute("SELECT root,enabled FROM games WHERE id=?", (game_id,)).fetchone()
+            profile = db.execute("SELECT game_id FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            if not game or not game["enabled"] or Path(game["root"]).resolve(strict=False) != root:
+                raise DeploymentError("Selected game registration does not match the deployment root")
+            if not profile or profile["game_id"] != game_id:
+                raise DeploymentError("Profile is not associated with the selected game")
+            unfinished = db.execute("SELECT id,status FROM deployments WHERE game_id=? AND status NOT IN ('success','rolled_back','failed_recovered')",
+                                    (game_id,)).fetchall()
+            if unfinished:
+                raise DeploymentError(f"Game has an unfinished deployment ({unfinished[0]['id']}, {unfinished[0]['status']}); inspect Recovery first")
+            rows = db.execute("SELECT id,journal,profile_id FROM deployments WHERE game_id=? AND status='success' ORDER BY started_at DESC",
+                              (game_id,)).fetchall()
+        old_manifest = {}
+        transactions = []
+        old_profile = rows[0]["profile_id"] if rows else profile_id
+        # Validate all recovery material and source files before the first live change.
+        for row in rows:
+            journal = self.journals / f"{row['id']}.json"
+            if journal.is_symlink() or not journal.is_file() or not journal.resolve().is_relative_to(self.journals):
+                raise DeploymentError(f"Missing or unsafe journal for active deployment {row['id']}")
+            try:
+                payload = json.loads(journal.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise DeploymentError(f"Cannot read active deployment journal {row['id']}: {exc}") from exc
+            if payload.get("id") != row["id"] or Path(payload.get("root", "")).resolve(strict=False) != root:
+                raise DeploymentError(f"Active deployment {row['id']} has inconsistent journal identity or root")
+            if payload.get("status") != "committed":
+                raise DeploymentError(f"Active deployment {row['id']} is not in a committed state; inspect Recovery")
+            for record in payload.get("files", []):
+                relative = adapter.validate_relative_path(record["path"])
+                source = Path(record.get("source", ""))
+                if source.is_symlink() or not source.is_file():
+                    raise DeploymentError(f"Cannot transition profile; previous source is missing: {source}")
+                if relative in old_manifest:
+                    raise DeploymentError(f"Previous deployments overlap at {relative}; inspect Recovery")
+                old_manifest[relative] = source
+            transactions.append(row["id"])
+        lock_path = self._lock_path(root)
+        with locked_file(lock_path):
+            all_previous_rolled_back = False
+            try:
+                from modforge.core.recovery_manager import RecoveryManager
+                recovery = RecoveryManager(self.db, self.backups, self.journals, self.lock_dir)
+                for deployment_id in transactions:
+                    recovery.recover(deployment_id, root, adapter, rollback_committed=True, lock_held=True)
+                all_previous_rolled_back = True
+                if not paths:
+                    return None
+                return self._deploy_locked(root, adapter, profile_id, paths, game_id)
+            except Exception as exc:
+                safely_reapply = all_previous_rolled_back and "inspect Recovery" not in str(exc)
+                if safely_reapply and old_manifest:
+                    try:
+                        self._deploy_locked(root, adapter, old_profile or profile_id, old_manifest, game_id)
+                    except Exception as restore_exc:
+                        raise DeploymentError(
+                            f"Profile transition failed ({exc}); restoring the previous profile also failed ({restore_exc}). Inspect Recovery."
+                        ) from restore_exc
+                if safely_reapply:
+                    raise DeploymentError(
+                        f"Profile transition failed ({exc}); the previous deployed files were restored."
+                    ) from exc
+                raise DeploymentError(
+                    f"Profile transition stopped ({exc}); no automatic overwrite was attempted. Inspect Recovery."
+                ) from exc
 
     def _lock_path(self, root: Path) -> Path:
         return self.lock_dir / (hashlib.sha256(str(root).encode()).hexdigest() + ".lock")
 
     def _deploy_locked(self, root: Path, adapter: GameAdapter, profile_id: str,
-                       manifest: dict[str, Path]) -> str:
+                       manifest: dict[str, Path], game_id: str | None = None) -> str:
         with self.db.connect() as db:
             for rel in manifest:
                 rows = db.execute("""SELECT df.relative_path FROM deployment_files df
                     JOIN deployments d ON d.id=df.deployment_id
                     WHERE d.status NOT IN ('rolled_back','failed_recovered')
-                    AND lower(df.relative_path)=lower(?)""", (rel,)).fetchall()
+                    AND (d.game_id IS NULL OR ? IS NULL OR d.game_id=?)
+                    AND lower(df.relative_path)=lower(?)""", (game_id, game_id, rel)).fetchall()
                 if rows:
                     raise DeploymentError(f"{rel} is managed by an earlier deployment; roll it back first")
 
@@ -147,6 +250,8 @@ class DeploymentManager:
             "id": deployment_id,
             "root": str(root),
             "profile_id": profile_id,
+            "game_id": game_id,
+            "adapter_id": adapter.game_id,
             "started_at": started,
             "updated_at": started,
             "status": "planned",
@@ -159,8 +264,8 @@ class DeploymentManager:
         write_json_durable(journal_path, payload)
         try:
             with self.db.connect() as db:
-                db.execute("INSERT INTO deployments(id,profile_id,started_at,status,journal) VALUES(?,?,?,?,?)",
-                           (deployment_id, profile_id, started, "planned", str(journal_path)))
+                db.execute("INSERT INTO deployments(id,profile_id,game_id,started_at,status,journal) VALUES(?,?,?,?,?,?)",
+                           (deployment_id, profile_id, game_id, started, "planned", str(journal_path)))
                 db.executemany("INSERT INTO deployment_files VALUES(?,?,?,?,?,?,?)", [
                     (deployment_id, r["path"], int(r["existed"]), r["original_hash"],
                      r["backup_path"], r["deployed_hash"], "planned") for r in records

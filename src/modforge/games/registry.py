@@ -15,6 +15,17 @@ def _now() -> str:
 class GameRegistry:
     def __init__(self, database):
         self.db = database
+        # Phase-1 registrations predate game-scoped profiles. Add a default profile
+        # without changing their IDs or existing profile membership.
+        now = _now()
+        with self.db.connect() as db:
+            for game in db.execute("SELECT id FROM games"):
+                exists = db.execute("SELECT 1 FROM profiles WHERE game_id=? AND is_default=1", (game["id"],)).fetchone()
+                if not exists:
+                    profile_id = "default" if game["id"] == "legacy-cyberpunk2077" else f"default-{game['id']}"
+                    profile_name = "Default" if profile_id == "default" else f"Default ({game['id'][:8]})"
+                    db.execute("INSERT OR IGNORE INTO profiles(id,name,created_at,game_id,is_default) VALUES(?,?,?,?,1)",
+                               (profile_id, profile_name, now, game["id"]))
 
     def list_games(self) -> list[dict]:
         with self.db.connect() as db:
@@ -48,6 +59,9 @@ class GameRegistry:
                        adapter_id,validation_status,validation_message,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,'unvalidated','',?,?)""",
                        (game_id,name,normalized,executable,launcher,platform,source,strategy,adapter_id,now,now))
+            profile_id = f"default-{game_id}"
+            db.execute("INSERT INTO profiles(id,name,created_at,game_id,is_default) VALUES(?,?,?,?,1)",
+                       (profile_id, f"Default ({game_id[:8]})", now, game_id))
         self.validate(game_id)
         return game_id
 
@@ -94,13 +108,22 @@ class GameRegistry:
 
     def remove(self, game_id: str) -> None:
         with self.db.connect() as db:
-            db.execute("DELETE FROM games WHERE id=?", (game_id,))
+            # Keep profile, mapping, deployment, and recovery relationships intact.
+            db.execute("UPDATE games SET enabled=0,updated_at=? WHERE id=?", (_now(), game_id))
+
+    def restore(self, game_id: str) -> None:
+        with self.db.connect() as db:
+            db.execute("UPDATE games SET enabled=1,updated_at=? WHERE id=?", (_now(), game_id))
 
     def adapter_for(self, game_id: str):
         game = self.get(game_id)
         if not game:
             raise ValueError("Select a registered game")
-        if game["adapter_id"] == "cyberpunk2077":
+        return self.adapter_by_id(game["adapter_id"])
+
+    @staticmethod
+    def adapter_by_id(adapter_id: str | None):
+        if adapter_id == "cyberpunk2077":
             from modforge.games.cyberpunk2077 import Cyberpunk2077Adapter
             return Cyberpunk2077Adapter()
         return GenericFileAdapter()

@@ -11,8 +11,11 @@ from modforge.config import AppPaths
 from modforge.core.archive_importer import ArchiveImporter
 from modforge.core.deployment_manager import DeploymentManager
 from modforge.core.mod_library import ModLibrary
+from modforge.core.profile_manager import ProfileManager
 from modforge.database import Database
 from modforge.ui.main_window import MainWindow
+from modforge.games.generic import GenericFileAdapter
+from modforge.games.registry import GameRegistry
 
 
 @pytest.fixture(scope="session")
@@ -86,3 +89,22 @@ def test_preview_blocks_symlink_destinations(window, tmp_path, monkeypatch):
     assert captured["action"] == "Blocked: symbolic link in destination path"
     assert not captured["enabled"]
     assert outside.read_text() == "keep"
+
+
+def test_profile_preview_lists_modforge_owned_removals(window,tmp_path,monkeypatch):
+    root=tmp_path/"fake-game";root.mkdir()
+    game_id=GameRegistry(window.db).register("Preview Game",root)
+    profile=ProfileManager(window.db).list_profiles(game_id)[0]["id"]
+    source=tmp_path/"source";source.write_text("mod")
+    deployment=window.deployments.deploy(root,GenericFileAdapter(),profile,{"mod/file.dat":source},game_id=game_id)
+    captured={}
+    def accept(dialog):
+        table=dialog.findChild(QTableWidget)
+        captured["action"]=table.item(0,3).text()
+        captured["enabled"]=dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Yes).isEnabled()
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(QDialog,"exec",accept)
+    assert window._show_deployment_preview(root,profile,[],{},game_id)
+    assert captured["action"]=="Remove ModForge-created file if unchanged"
+    assert captured["enabled"]
+    assert (root/"mod/file.dat").exists()
